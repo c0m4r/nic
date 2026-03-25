@@ -1,0 +1,16 @@
+[Unit]
+Description=nic - network interface configurator
+DefaultDependencies=no
+Wants=network.target
+Before=network.target network-online.target
+After=local-fs.target systemd-udevd.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/nic start
+ExecStop=/usr/local/sbin/nic stop
+ExecReload=/usr/local/sbin/nic reload --force
+
+[Install]
+WantedBy=multi-user.target

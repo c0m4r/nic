@@ -1,0 +1,349 @@
+package state
+
+import (
+	"encoding/json"
+	"fmt"
+	"io"
+	"os"
+	"strings"
+
+	"github.com/c0m4r/nic/internal/color"
+	"github.com/c0m4r/nic/internal/executor"
+)
+
+type Interface struct {
+	IfIndex   int      `json:"ifindex"`
+	IfName    string   `json:"ifname"`
+	Flags     []string `json:"flags"`
+	MTU       int      `json:"mtu"`
+	Address   string   `json:"address"`
+	OperState string   `json:"operstate"`
+	Link      string   `json:"link_type"`
+}
+
+type AddrEntry struct {
+	IfName   string     `json:"ifname"`
+	AddrInfo []AddrInfo `json:"addr_info"`
+}
+
+type AddrInfo struct {
+	Family    string `json:"family"`
+	Local     string `json:"local"`
+	PrefixLen int    `json:"prefixlen"`
+	Scope     string `json:"scope"`
+	Label     string `json:"label"`
+	Dynamic   bool   `json:"dynamic"`
+	Tentative bool   `json:"tentative"`
+}
+
+type Route struct {
+	Dst      string `json:"dst"`
+	Gateway  string `json:"gateway"`
+	Dev      string `json:"dev"`
+	Protocol string `json:"protocol"`
+	Scope    string `json:"scope"`
+	Metric   int    `json:"metric"`
+}
+
+// NetworkState holds a snapshot of the network configuration.
+type NetworkState struct {
+	Interfaces []Interface `json:"interfaces"`
+	Addresses  []AddrEntry `json:"addresses"`
+	Routes     []Route     `json:"routes"`
+	Routes6    []Route     `json:"routes6"`
+}
+
+// GetInterfaces returns all network interfaces.
+func GetInterfaces() ([]Interface, error) {
+	output := executor.RunSilent("ip", "-j", "link", "show")
+	if output == "" {
+		return nil, fmt.Errorf("failed to get interfaces")
+	}
+	var ifaces []Interface
+	if err := json.Unmarshal([]byte(output), &ifaces); err != nil {
+		return nil, fmt.Errorf("parse interfaces: %w", err)
+	}
+	return ifaces, nil
+}
+
+// GetAddresses returns all addresses on all interfaces.
+func GetAddresses() ([]AddrEntry, error) {
+	output := executor.RunSilent("ip", "-j", "addr", "show")
+	if output == "" {
+		return nil, fmt.Errorf("failed to get addresses")
+	}
+	var addrs []AddrEntry
+	if err := json.Unmarshal([]byte(output), &addrs); err != nil {
+		return nil, fmt.Errorf("parse addresses: %w", err)
+	}
+	return addrs, nil
+}
+
+// GetRoutes returns IPv4 routes.
+func GetRoutes() ([]Route, error) {
+	output := executor.RunSilent("ip", "-j", "route", "show")
+	if output == "" {
+		return nil, fmt.Errorf("failed to get routes")
+	}
+	var routes []Route
+	if err := json.Unmarshal([]byte(output), &routes); err != nil {
+		return nil, fmt.Errorf("parse routes: %w", err)
+	}
+	return routes, nil
+}
+
+// GetRoutes6 returns IPv6 routes.
+func GetRoutes6() ([]Route, error) {
+	output := executor.RunSilent("ip", "-j", "-6", "route", "show")
+	if output == "" {
+		return nil, fmt.Errorf("failed to get ipv6 routes")
+	}
+	var routes []Route
+	if err := json.Unmarshal([]byte(output), &routes); err != nil {
+		return nil, fmt.Errorf("parse ipv6 routes: %w", err)
+	}
+	return routes, nil
+}
+
+// Capture takes a full snapshot of current network state.
+func Capture() (*NetworkState, error) {
+	ifaces, _ := GetInterfaces()
+	addrs, _ := GetAddresses()
+	routes, _ := GetRoutes()
+	routes6, _ := GetRoutes6()
+
+	return &NetworkState{
+		Interfaces: ifaces,
+		Addresses:  addrs,
+		Routes:     routes,
+		Routes6:    routes6,
+	}, nil
+}
+
+// SaveState saves network state to a JSON file.
+func SaveState(path string) error {
+	st, err := Capture()
+	if err != nil {
+		return err
+	}
+	data, err := json.MarshalIndent(st, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(path, data, 0600)
+}
+
+// LoadState loads network state from a JSON file.
+func LoadState(path string) (*NetworkState, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	var st NetworkState
+	if err := json.Unmarshal(data, &st); err != nil {
+		return nil, err
+	}
+	return &st, nil
+}
+
+// RestoreState restores network state from a saved snapshot.
+func RestoreState(path string) error {
+	st, err := LoadState(path)
+	if err != nil {
+		return fmt.Errorf("load state: %w", err)
+	}
+
+	// Flush all addresses and routes on non-loopback interfaces
+	for _, iface := range st.Interfaces {
+		if iface.IfName == "lo" {
+			continue
+		}
+		_, _ = executor.RunIP("addr", "flush", "dev", iface.IfName)
+		_, _ = executor.RunIP("route", "flush", "dev", iface.IfName)
+	}
+
+	// Restore addresses
+	for _, entry := range st.Addresses {
+		if entry.IfName == "lo" {
+			continue
+		}
+		for _, addr := range entry.AddrInfo {
+			if addr.Scope == "link" && addr.Family == "inet6" {
+				continue // Skip link-local, auto-generated
+			}
+			cidr := fmt.Sprintf("%s/%d", addr.Local, addr.PrefixLen)
+			_, _ = executor.RunIP("addr", "add", cidr, "dev", entry.IfName)
+		}
+	}
+
+	// Restore routes
+	for _, route := range st.Routes {
+		args := []string{"route", "add"}
+		if route.Dst == "" || route.Dst == "default" {
+			args = append(args, "default")
+		} else {
+			args = append(args, route.Dst)
+		}
+		if route.Gateway != "" {
+			args = append(args, "via", route.Gateway)
+		}
+		if route.Dev != "" {
+			args = append(args, "dev", route.Dev)
+		}
+		_, _ = executor.RunIP(args...)
+	}
+
+	// Restore interface states
+	for _, iface := range st.Interfaces {
+		if iface.IfName == "lo" {
+			continue
+		}
+		ifState := "down"
+		for _, flag := range iface.Flags {
+			if flag == "UP" {
+				ifState = "up"
+				break
+			}
+		}
+		_, _ = executor.RunIP("link", "set", iface.IfName, ifState)
+	}
+
+	return nil
+}
+
+func colorizeState(s string) string {
+	upper := strings.ToUpper(s)
+	switch upper {
+	case "UP":
+		return color.BoldGreen(upper)
+	case "DOWN":
+		return color.BoldRed(upper)
+	default:
+		return color.BoldYellow(upper)
+	}
+}
+
+func colorizeAddr(addr string, family string) string {
+	if family == "inet6" {
+		return color.Blue(addr)
+	}
+	return color.Yellow(addr)
+}
+
+// PrintStatus writes a formatted network status to the writer.
+func PrintStatus(w io.Writer) {
+	// --- DNS ---
+	_, _ = fmt.Fprintf(w, "%s\n", color.Bold("DNS:"))
+	servers := readResolv()
+	if len(servers) == 0 {
+		_, _ = fmt.Fprintf(w, "  %s\n", color.Dim("(none)"))
+	}
+	for _, ns := range servers {
+		_, _ = fmt.Fprintf(w, "  nameserver %s\n", color.Cyan(ns))
+	}
+
+	// --- Interfaces ---
+	_, _ = fmt.Fprintf(w, "\n%s\n", color.Bold("Interfaces:"))
+	addrs, _ := GetAddresses()
+	printed := 0
+	for _, entry := range addrs {
+		// Header line: name | state | mac (skip state for loopback)
+		header := "  " + color.BoldCyan(entry.IfName)
+
+		if entry.IfName != "lo" {
+			stateBytes, _ := os.ReadFile(fmt.Sprintf("/sys/class/net/%s/operstate", entry.IfName))
+			opState := strings.TrimSpace(string(stateBytes))
+			if opState == "" {
+				opState = "unknown"
+			}
+			header += fmt.Sprintf(" %s %s", color.Gray("|"), colorizeState(opState))
+		}
+
+		macBytes, _ := os.ReadFile(fmt.Sprintf("/sys/class/net/%s/address", entry.IfName))
+		mac := strings.TrimSpace(string(macBytes))
+		if mac != "" && mac != "00:00:00:00:00:00" {
+			header += fmt.Sprintf(" %s %s", color.Gray("|"), color.Gray(mac))
+		}
+		_, _ = fmt.Fprintln(w, header)
+
+		// Address lines
+		for _, a := range entry.AddrInfo {
+			cidr := fmt.Sprintf("%s/%d", a.Local, a.PrefixLen)
+			suffix := ""
+			if a.Tentative {
+				suffix = color.BoldYellow(" (tentative)")
+			}
+			if a.Dynamic {
+				suffix += color.Dim(" dynamic")
+			}
+			if a.Scope == "link" {
+				suffix += color.Dim(" link-local")
+			}
+			_, _ = fmt.Fprintf(w, "    %s %s%s\n",
+				color.Gray("⤷"),
+				colorizeAddr(cidr, a.Family),
+				suffix)
+		}
+
+		printed++
+		// Blank line between interfaces (except last)
+		if printed < len(addrs)-1 {
+			_, _ = fmt.Fprintln(w)
+		}
+	}
+
+	// --- IPv4 Routes ---
+	_, _ = fmt.Fprintf(w, "\n%s\n", color.Bold("Routes:"))
+	routes, _ := GetRoutes()
+	for _, r := range routes {
+		_, _ = fmt.Fprintln(w, formatRoute(r))
+	}
+
+	// --- IPv6 Routes ---
+	routes6, _ := GetRoutes6()
+	if len(routes6) > 0 {
+		_, _ = fmt.Fprintf(w, "\n%s\n", color.Bold("IPv6 Routes:"))
+		for _, r := range routes6 {
+			_, _ = fmt.Fprintln(w, formatRoute(r))
+		}
+	}
+}
+
+func formatRoute(r Route) string {
+	dst := r.Dst
+	if dst == "" {
+		dst = "default"
+	}
+	line := "  " + color.Bold(dst)
+	if r.Gateway != "" {
+		line += " via " + color.Yellow(r.Gateway)
+	}
+	if r.Dev != "" {
+		line += " dev " + color.Cyan(r.Dev)
+	}
+	if r.Protocol != "" && r.Protocol != "boot" && r.Protocol != "kernel" {
+		line += color.Dim(" proto " + r.Protocol)
+	}
+	if r.Scope != "" && r.Scope != "global" && r.Scope != "universe" {
+		line += color.Dim(" scope " + r.Scope)
+	}
+	return line
+}
+
+func readResolv() []string {
+	data, err := os.ReadFile("/etc/resolv.conf")
+	if err != nil {
+		return nil
+	}
+	var servers []string
+	for _, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "nameserver ") {
+			ns := strings.TrimSpace(strings.TrimPrefix(line, "nameserver "))
+			if ns != "" {
+				servers = append(servers, ns)
+			}
+		}
+	}
+	return servers
+}

@@ -1,0 +1,39 @@
+#!/bin/sh
+### BEGIN INIT INFO
+# Provides:          nic networking
+# Required-Start:    mountkernfs $local_fs
+# Required-Stop:     $local_fs
+# Default-Start:     S
+# Default-Stop:      0 6
+# Short-Description: nic network interface configurator
+### END INIT INFO
+
+NIC="/usr/local/sbin/nic"
+
+case "$1" in
+    start)
+        echo "Starting nic..."
+        $NIC start
+        ;;
+    stop)
+        echo "Stopping nic..."
+        $NIC stop
+        ;;
+    restart)
+        echo "Restarting nic..."
+        $NIC stop
+        $NIC start
+        ;;
+    reload)
+        echo "Reloading nic..."
+        $NIC reload --force
+        ;;
+    status)
+        $NIC status
+        ;;
+    *)
+        echo "Usage: $0 {start|stop|restart|reload|status}"
+        exit 1
+        ;;
+esac
+exit 0

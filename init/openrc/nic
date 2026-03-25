@@ -1,0 +1,29 @@
+#!/sbin/openrc-run
+
+description="nic - network interface configurator"
+command="/usr/local/sbin/nic"
+
+depend() {
+    need localmount
+    before net dns
+    after udev
+    provide net
+}
+
+start() {
+    ebegin "Starting nic"
+    ${command} start
+    eend $?
+}
+
+stop() {
+    ebegin "Stopping nic"
+    ${command} stop
+    eend $?
+}
+
+reload() {
+    ebegin "Reloading nic"
+    ${command} reload --force
+    eend $?
+}
