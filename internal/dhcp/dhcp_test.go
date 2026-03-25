@@ -177,8 +177,19 @@ func TestWrapUDPIP(t *testing.T) {
 }
 
 func TestExtractDHCPPayload(t *testing.T) {
-	payload := buildDiscover(net.HardwareAddr{0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff}, 1)
-	packet := wrapUDPIP(payload)
+	// Simulate an incoming server→client packet (dst port 68)
+	dhcpPayload := buildDiscover(net.HardwareAddr{0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff}, 1)
+	totalLen := ipHeaderLen + udpHeaderLen + len(dhcpPayload)
+	packet := make([]byte, totalLen)
+	packet[0] = 0x45
+	binary.BigEndian.PutUint16(packet[2:4], uint16(totalLen))
+	packet[8] = 64
+	packet[9] = 17 // UDP
+	// src port 67 (server), dst port 68 (client)
+	binary.BigEndian.PutUint16(packet[ipHeaderLen:], 67)
+	binary.BigEndian.PutUint16(packet[ipHeaderLen+2:], 68)
+	binary.BigEndian.PutUint16(packet[ipHeaderLen+4:], uint16(udpHeaderLen+len(dhcpPayload)))
+	copy(packet[ipHeaderLen+udpHeaderLen:], dhcpPayload)
 
 	extracted := extractDHCPPayload(packet)
 	if extracted == nil {

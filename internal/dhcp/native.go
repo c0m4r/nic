@@ -2,8 +2,12 @@ package dhcp
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"net"
+	"os"
+	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 )
@@ -24,7 +28,7 @@ var (
 )
 
 func startNative(iface string) error {
-	stopNative(iface)
+	stopNativeKey(iface)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	nc := &nativeClient{
@@ -37,90 +41,90 @@ func startNative(iface string) error {
 	nativeClients[iface] = nc
 	nativeClientsMu.Unlock()
 
-	// Run DHCPv4 and DHCPv6 in parallel
-	var wg sync.WaitGroup
-	var v4err, v6err error
-	var v4lease *Lease
-	var v6lease *LeaseV6
+	acquireCtx, acquireCancel := context.WithTimeout(ctx, 30*time.Second)
+	defer acquireCancel()
 
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		v4lease, v4err = runDHCPv4(ctx, iface)
-	}()
+	v4lease, v4err := runDHCPv4(acquireCtx, iface)
 
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		v6lease, v6err = runDHCPv6(ctx, iface)
-	}()
-
-	// Wait for both with a timeout
-	waitDone := make(chan struct{})
-	go func() {
-		wg.Wait()
-		close(waitDone)
-	}()
-
-	select {
-	case <-waitDone:
-	case <-time.After(30 * time.Second):
-		cancel()
-		<-waitDone
-	}
-
-	// Apply whatever we got
-	applied := false
-
-	if v4err == nil && v4lease != nil {
-		if err := applyLease(iface, v4lease); err != nil {
-			fmt.Printf("dhcp v4: apply failed: %v\n", err)
-		} else {
-			nc.mu.Lock()
-			nc.lease = v4lease
-			nc.mu.Unlock()
-			_ = v4lease.save()
-			applied = true
-			fmt.Printf("dhcp: %s got %s via %s (lease %ds)\n",
-				iface, v4lease.CIDR(), v4lease.Router, v4lease.LeaseTime)
-		}
-	}
-
-	if v6err == nil && v6lease != nil {
-		if err := applyLeaseV6(iface, v6lease); err != nil {
-			fmt.Printf("dhcp v6: apply failed: %v\n", err)
-		} else {
-			nc.mu.Lock()
-			nc.leaseV6 = v6lease
-			nc.mu.Unlock()
-			_ = v6lease.save()
-			applied = true
-			for _, addr := range v6lease.Addresses {
-				fmt.Printf("dhcp: %s got %s/%d (v6, valid %ds)\n",
-					iface, addr.IP, addr.PrefixLen, addr.ValidLife)
-			}
-		}
-	}
-
-	if !applied {
+	if v4err != nil || v4lease == nil {
 		cancel()
 		nativeClientsMu.Lock()
 		delete(nativeClients, iface)
 		nativeClientsMu.Unlock()
-
-		// Return the most informative error
 		if v4err != nil {
 			return fmt.Errorf("dhcp v4: %w", v4err)
 		}
+		return fmt.Errorf("dhcp: no v4 lease on %s", iface)
+	}
+
+	if err := applyLease(iface, v4lease); err != nil {
+		fmt.Printf("%s: apply failed: %v\n", iface, err)
+		cancel()
+		nativeClientsMu.Lock()
+		delete(nativeClients, iface)
+		nativeClientsMu.Unlock()
+		return fmt.Errorf("%s: %w", iface, err)
+	}
+
+	nc.mu.Lock()
+	nc.lease = v4lease
+	nc.mu.Unlock()
+	_ = v4lease.save()
+
+	go nc.renewLoop(ctx)
+	return nil
+}
+
+func startNativeV6(iface string) error {
+	key := iface + ":6"
+	stopNativeKey(key)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	nc := &nativeClient{
+		iface:  iface,
+		cancel: cancel,
+		done:   make(chan struct{}),
+	}
+
+	nativeClientsMu.Lock()
+	nativeClients[key] = nc
+	nativeClientsMu.Unlock()
+
+	acquireCtx, acquireCancel := context.WithTimeout(ctx, 30*time.Second)
+	defer acquireCancel()
+
+	v6lease, v6err := runDHCPv6(acquireCtx, iface)
+
+	if v6err != nil || v6lease == nil {
+		cancel()
+		nativeClientsMu.Lock()
+		delete(nativeClients, key)
+		nativeClientsMu.Unlock()
 		if v6err != nil {
 			return fmt.Errorf("dhcp v6: %w", v6err)
 		}
-		return fmt.Errorf("dhcp: no lease obtained on %s", iface)
+		return fmt.Errorf("dhcp: no v6 lease on %s", iface)
 	}
 
-	// Start renewal goroutine
-	go nc.renewLoop(ctx)
+	if err := applyLeaseV6(iface, v6lease); err != nil {
+		fmt.Printf("%s: v6 apply failed: %v\n", iface, err)
+		cancel()
+		nativeClientsMu.Lock()
+		delete(nativeClients, key)
+		nativeClientsMu.Unlock()
+		return fmt.Errorf("%s: %w", iface, err)
+	}
 
+	nc.mu.Lock()
+	nc.leaseV6 = v6lease
+	nc.mu.Unlock()
+	_ = v6lease.save()
+	for _, addr := range v6lease.Addresses {
+		fmt.Printf("%s: leased %s/%d (v6, valid %ds)\n",
+			iface, addr.IP, addr.PrefixLen, addr.ValidLife)
+	}
+
+	go nc.renewLoop(ctx)
 	return nil
 }
 
@@ -268,11 +272,11 @@ func (nc *nativeClient) release() {
 	}
 }
 
-func stopNative(iface string) {
+func stopNativeKey(key string) {
 	nativeClientsMu.Lock()
-	nc, ok := nativeClients[iface]
+	nc, ok := nativeClients[key]
 	if ok {
-		delete(nativeClients, iface)
+		delete(nativeClients, key)
 	}
 	nativeClientsMu.Unlock()
 
@@ -280,6 +284,11 @@ func stopNative(iface string) {
 		nc.cancel()
 		<-nc.done
 	}
+}
+
+func stopNative(iface string) {
+	stopNativeKey(iface)
+	stopNativeKey(iface + ":6")
 }
 
 func stopAllNative() {
@@ -295,31 +304,74 @@ func stopAllNative() {
 		nc.cancel()
 		<-nc.done
 	}
+
+	// Also clean up any leases saved to disk (from a previous process)
+	cleanupDiskLeases()
+}
+
+// cleanupDiskLeases removes addresses from lease files left by a previous nic process.
+func cleanupDiskLeases() {
+	entries, err := os.ReadDir(pidDir)
+	if err != nil {
+		return
+	}
+	for _, entry := range entries {
+		name := entry.Name()
+		if strings.HasSuffix(name, ".lease.json") && !strings.HasSuffix(name, ".v6.lease.json") {
+			iface := strings.TrimSuffix(name, ".lease.json")
+			data, err := os.ReadFile(filepath.Join(pidDir, name))
+			if err != nil {
+				continue
+			}
+			var lease Lease
+			if err := json.Unmarshal(data, &lease); err != nil {
+				continue
+			}
+			unapplyLease(iface, &lease)
+			_ = os.Remove(filepath.Join(pidDir, name))
+		}
+		if strings.HasSuffix(name, ".v6.lease.json") {
+			iface := strings.TrimSuffix(name, ".v6.lease.json")
+			data, err := os.ReadFile(filepath.Join(pidDir, name))
+			if err != nil {
+				continue
+			}
+			var lease LeaseV6
+			if err := json.Unmarshal(data, &lease); err != nil {
+				continue
+			}
+			unapplyLeaseV6(iface, &lease)
+			_ = os.Remove(filepath.Join(pidDir, name))
+		}
+	}
 }
 
 func statusNative(iface string) string {
 	nativeClientsMu.Lock()
-	nc, ok := nativeClients[iface]
+	nc, okV4 := nativeClients[iface]
+	ncV6, okV6 := nativeClients[iface+":6"]
 	nativeClientsMu.Unlock()
 
-	if !ok {
+	var parts []string
+
+	if okV4 {
+		nc.mu.Lock()
+		if nc.lease != nil {
+			parts = append(parts, fmt.Sprintf("v4=%s", nc.lease.CIDR()))
+		}
+		nc.mu.Unlock()
+	}
+
+	if okV6 {
+		ncV6.mu.Lock()
+		if ncV6.leaseV6 != nil && len(ncV6.leaseV6.Addresses) > 0 {
+			parts = append(parts, fmt.Sprintf("v6=%s", ncV6.leaseV6.Addresses[0].IP))
+		}
+		ncV6.mu.Unlock()
+	}
+
+	if len(parts) == 0 {
 		return ""
 	}
-
-	nc.mu.Lock()
-	defer nc.mu.Unlock()
-
-	parts := []string{"native dhcp"}
-	if nc.lease != nil {
-		parts = append(parts, fmt.Sprintf("v4=%s", nc.lease.CIDR()))
-	}
-	if nc.leaseV6 != nil && len(nc.leaseV6.Addresses) > 0 {
-		parts = append(parts, fmt.Sprintf("v6=%s", nc.leaseV6.Addresses[0].IP))
-	}
-
-	result := parts[0]
-	for _, p := range parts[1:] {
-		result += " " + p
-	}
-	return result
+	return "native dhcp " + strings.Join(parts, " ")
 }

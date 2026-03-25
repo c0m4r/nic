@@ -61,7 +61,7 @@ func main() {
 			fatal(err)
 		}
 	case "stop":
-		if err := cmdStop(configPath); err != nil {
+		if err := cmdStop(configPath, cmdArgs); err != nil {
 			fatal(err)
 		}
 	case "restart":
@@ -84,10 +84,6 @@ func main() {
 		}
 	case "confirm":
 		if err := cmdConfirm(); err != nil {
-			fatal(err)
-		}
-	case "install":
-		if err := cmdInstall(cmdArgs); err != nil {
 			fatal(err)
 		}
 	case "version":
@@ -120,7 +116,6 @@ Commands:
   show                   Show parsed configuration
   dry-run                Show what would be done without applying
   confirm                Confirm changes after reload/restart with timeout
-  install <init-system>  Install init scripts (systemd|openrc|sysv|runit)
   version                Show version
 
 Options:
@@ -201,6 +196,15 @@ func applyConfig(cfg *config.Config) error {
 				return fmt.Errorf("%s:%d: %w", cmd.File, cmd.LineNum, err)
 			}
 
+		case config.CmdDHCPv6:
+			iface := cmd.Tokens[1]
+			if resolved, ok := mgr.Get(iface); ok {
+				iface = resolved
+			}
+			if err := dhcp.StartV6(iface); err != nil {
+				return fmt.Errorf("%s:%d: %w", cmd.File, cmd.LineNum, err)
+			}
+
 		case config.CmdIPRoute2, config.CmdIfShortcut, config.CmdIPShortcut, config.CmdRouteShortcut:
 			ipArgs := config.ExpandCommand(cmd)
 			if ipArgs == nil {
@@ -240,13 +244,28 @@ func applyConfig(cfg *config.Config) error {
 	return nil
 }
 
-func cmdStop(configPath string) error {
+func cmdStop(configPath string, cmdArgs []string) error {
+	force := false
+	for _, arg := range cmdArgs {
+		if arg == "--force" {
+			force = true
+		}
+	}
+
+	if !force {
+		fmt.Print("This will tear down all network configuration. Continue? [y/N] ")
+		if !confirm() {
+			fmt.Println("Aborted.")
+			return nil
+		}
+	}
+
 	cfg, err := config.Load(configPath)
 	if err != nil {
 		return fmt.Errorf("load config: %w", err)
 	}
 
-	// Stop DHCP clients
+	// Stop DHCP clients (also cleans up addresses from disk leases)
 	dhcp.StopAll()
 
 	// Disconnect WiFi
@@ -373,9 +392,9 @@ func cmdRestart(configPath string, cmdArgs []string) error {
 		}
 	}
 
-	// Stop
-	if err := cmdStop(configPath); err != nil {
-		fmt.Fprintf(os.Stderr, "warning during stop: %v\n", err)
+	// Stop (force — we already confirmed above)
+	if err := cmdStop(configPath, []string{"--force"}); err != nil {
+		_, _ = fmt.Fprintf(os.Stderr, "warning during stop: %v\n", err)
 	}
 
 	// Start
@@ -498,200 +517,6 @@ func cmdConfirm() error {
 		return err
 	}
 	fmt.Println(color.Green("Changes confirmed."))
-	return nil
-}
-
-func cmdInstall(args []string) error {
-	if len(args) == 0 {
-		return fmt.Errorf("usage: nic install <systemd|openrc|sysv|runit>")
-	}
-
-	initSystem := args[0]
-	selfBin, err := os.Executable()
-	if err != nil {
-		selfBin = "/usr/local/sbin/nic"
-	}
-
-	switch initSystem {
-	case "systemd":
-		return installSystemd(selfBin)
-	case "openrc":
-		return installOpenRC(selfBin)
-	case "sysv":
-		return installSysV(selfBin)
-	case "runit":
-		return installRunit(selfBin)
-	default:
-		return fmt.Errorf("unsupported init system: %s (use: systemd, openrc, sysv, runit)", initSystem)
-	}
-}
-
-// --- Init system installation ---
-
-func installSystemd(nicBin string) error {
-	// Disable and mask systemd-networkd and systemd-resolved
-	services := []string{"systemd-networkd", "systemd-resolved",
-		"systemd-networkd-wait-online", "systemd-networkd.socket"}
-	for _, svc := range services {
-		_, _ = executor.Run("systemctl", "stop", svc)
-		_, _ = executor.Run("systemctl", "disable", svc)
-		_, _ = executor.Run("systemctl", "mask", svc)
-	}
-
-	// Write nic.service
-	unit := fmt.Sprintf(`[Unit]
-Description=nic - network interface configurator
-DefaultDependencies=no
-Wants=network.target
-Before=network.target network-online.target
-After=local-fs.target systemd-udevd.service
-
-[Service]
-Type=oneshot
-RemainAfterExit=yes
-ExecStart=%s start
-ExecStop=%s stop
-ExecReload=%s reload --force
-
-[Install]
-WantedBy=multi-user.target
-`, nicBin, nicBin, nicBin)
-
-	if err := os.WriteFile("/etc/systemd/system/nic.service", []byte(unit), 0644); err != nil {
-		return fmt.Errorf("write nic.service: %w", err)
-	}
-
-	if _, err := executor.Run("systemctl", "daemon-reload"); err != nil {
-		return err
-	}
-	if _, err := executor.Run("systemctl", "enable", "nic.service"); err != nil {
-		return err
-	}
-
-	fmt.Println("Installed and enabled nic.service")
-	fmt.Println("Masked: systemd-networkd, systemd-resolved")
-	return nil
-}
-
-func installOpenRC(nicBin string) error {
-	script := fmt.Sprintf(`#!/sbin/openrc-run
-
-description="nic - network interface configurator"
-command="%s"
-
-depend() {
-    need localmount
-    before net dns
-    after udev
-    provide net
-}
-
-start() {
-    ebegin "Starting nic"
-    ${command} start
-    eend $?
-}
-
-stop() {
-    ebegin "Stopping nic"
-    ${command} stop
-    eend $?
-}
-
-reload() {
-    ebegin "Reloading nic"
-    ${command} reload --force
-    eend $?
-}
-`, nicBin)
-
-	if err := os.WriteFile("/etc/init.d/nic", []byte(script), 0755); err != nil {
-		return fmt.Errorf("write /etc/init.d/nic: %w", err)
-	}
-
-	_, _ = executor.Run("rc-update", "add", "nic", "boot")
-	fmt.Println("Installed and enabled nic for OpenRC (boot runlevel)")
-	return nil
-}
-
-func installSysV(nicBin string) error {
-	script := fmt.Sprintf(`#!/bin/sh
-### BEGIN INIT INFO
-# Provides:          nic networking
-# Required-Start:    mountkernfs $local_fs
-# Required-Stop:     $local_fs
-# Default-Start:     S
-# Default-Stop:      0 6
-# Short-Description: nic network interface configurator
-### END INIT INFO
-
-NIC="%s"
-
-case "$1" in
-    start)
-        echo "Starting nic..."
-        $NIC start
-        ;;
-    stop)
-        echo "Stopping nic..."
-        $NIC stop
-        ;;
-    restart)
-        echo "Restarting nic..."
-        $NIC stop
-        $NIC start
-        ;;
-    reload)
-        echo "Reloading nic..."
-        $NIC reload --force
-        ;;
-    status)
-        $NIC status
-        ;;
-    *)
-        echo "Usage: $0 {start|stop|restart|reload|status}"
-        exit 1
-        ;;
-esac
-exit 0
-`, nicBin)
-
-	if err := os.WriteFile("/etc/init.d/nic", []byte(script), 0755); err != nil {
-		return fmt.Errorf("write /etc/init.d/nic: %w", err)
-	}
-
-	if executor.CommandExists("update-rc.d") {
-		_, _ = executor.Run("update-rc.d", "nic", "defaults")
-	} else if executor.CommandExists("chkconfig") {
-		_, _ = executor.Run("chkconfig", "--add", "nic")
-	}
-
-	fmt.Println("Installed /etc/init.d/nic (SysV)")
-	return nil
-}
-
-func installRunit(nicBin string) error {
-	_ = os.MkdirAll("/etc/sv/nic", 0755)
-
-	run := fmt.Sprintf(`#!/bin/sh
-exec %s start
-`, nicBin)
-
-	finish := fmt.Sprintf(`#!/bin/sh
-%s stop
-`, nicBin)
-
-	if err := os.WriteFile("/etc/sv/nic/run", []byte(run), 0755); err != nil {
-		return fmt.Errorf("write run: %w", err)
-	}
-	if err := os.WriteFile("/etc/sv/nic/finish", []byte(finish), 0755); err != nil {
-		return fmt.Errorf("write finish: %w", err)
-	}
-
-	// Link to active services
-	_ = os.Symlink("/etc/sv/nic", "/var/service/nic")
-
-	fmt.Println("Installed /etc/sv/nic (runit)")
 	return nil
 }
 

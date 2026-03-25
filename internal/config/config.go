@@ -21,6 +21,7 @@ const (
 	CmdNameserver                   // nameserver <ip> / ns <ip>
 	CmdWifi                         // wifi <ssid> <password> [iface]
 	CmdDHCP                         // dhcp <iface> [client]
+	CmdDHCPv6                       // dhcpv6 <iface>
 	CmdIfShortcut                   // if <iface> up/down  OR  up/down <iface>
 	CmdIPShortcut                   // ip <addr>[/prefix] <iface>
 	CmdRouteShortcut                // route <dest> [via <gw>] <iface>
@@ -173,6 +174,13 @@ func parseLine(line, file string, lineNum int) (Command, error) {
 		cmd.Type = CmdDHCP
 		return cmd, nil
 
+	case "dhcpv6":
+		if len(tokens) < 2 {
+			return cmd, fmt.Errorf("dhcpv6 requires an interface: dhcpv6 <iface>")
+		}
+		cmd.Type = CmdDHCPv6
+		return cmd, nil
+
 	case "if":
 		if len(tokens) < 3 {
 			return cmd, fmt.Errorf("if requires interface and state: if <iface> up|down")
@@ -198,7 +206,10 @@ func parseLine(line, file string, lineNum int) (Command, error) {
 
 	case "ip":
 		// Distinguish between: ip <iproute2 command> and ip <addr> <iface> shortcut
-		if len(tokens) >= 3 && isIPAddress(tokens[1]) {
+		if len(tokens) >= 2 && isIPAddress(tokens[1]) {
+			if len(tokens) < 3 {
+				return cmd, fmt.Errorf("ip shortcut requires interface: ip <addr> <iface>")
+			}
 			cmd.Type = CmdIPShortcut
 			return cmd, nil
 		}
@@ -270,6 +281,8 @@ func ExpandCommandString(cmd Command) string {
 			client = " using " + cmd.Tokens[2]
 		}
 		return fmt.Sprintf("dhcp %s%s", iface, client)
+	case CmdDHCPv6:
+		return fmt.Sprintf("dhcpv6 %s", cmd.Tokens[1])
 	default:
 		return cmd.Raw
 	}

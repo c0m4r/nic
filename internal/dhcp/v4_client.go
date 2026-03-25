@@ -28,6 +28,8 @@ func runDHCPv4(ctx context.Context, iface string) (*Lease, error) {
 
 	xid := rand.Uint32()
 
+	fmt.Printf("%s: soliciting a DHCP lease\n", iface)
+
 	// DISCOVER
 	offer, err := doDiscover(ctx, fd, mac, xid, ifIndex)
 	if err != nil {
@@ -40,13 +42,22 @@ func runDHCPv4(ctx context.Context, iface string) (*Lease, error) {
 		return nil, fmt.Errorf("offer missing server ID")
 	}
 
+	fmt.Printf("%s: offered %s from %s\n", iface, offeredIP, net.IP(serverID))
+
 	// REQUEST
 	ack, err := doRequest(ctx, fd, mac, xid, ifIndex, net.IP(serverID), offeredIP)
 	if err != nil {
 		return nil, err
 	}
 
-	return parseLease(iface, ack)
+	lease, err := parseLease(iface, ack)
+	if err != nil {
+		return nil, err
+	}
+
+	fmt.Printf("%s: leased %s for %d seconds\n", iface, lease.IP, lease.LeaseTime)
+
+	return lease, nil
 }
 
 // doDiscover sends DHCPDISCOVER and waits for DHCPOFFER.

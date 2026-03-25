@@ -272,16 +272,19 @@ func wrapUDPIP(payload []byte) []byte {
 	// IP header
 	buf[0] = 0x45 // version 4, IHL 5
 	binary.BigEndian.PutUint16(buf[2:4], uint16(totalLen))
-	buf[8] = 64                                         // TTL
-	buf[9] = 17                                         // UDP
-	copy(buf[12:16], net.IPv4zero.To4())                // src: 0.0.0.0
-	copy(buf[16:20], net.IPv4bcast.To4())               // dst: 255.255.255.255
+	buf[8] = 64 // TTL
+	buf[9] = 17 // UDP
+	// src: 0.0.0.0 (buf already zeroed)
+	buf[16] = 255 // dst: 255.255.255.255
+	buf[17] = 255
+	buf[18] = 255
+	buf[19] = 255
 	binary.BigEndian.PutUint16(buf[10:12], ipChecksum(buf[:ipHeaderLen]))
 
 	// UDP header
 	udpStart := ipHeaderLen
-	binary.BigEndian.PutUint16(buf[udpStart:], 68)                           // src port
-	binary.BigEndian.PutUint16(buf[udpStart+2:], 67)                         // dst port
+	binary.BigEndian.PutUint16(buf[udpStart:], 68)                                  // src port
+	binary.BigEndian.PutUint16(buf[udpStart+2:], 67)                                // dst port
 	binary.BigEndian.PutUint16(buf[udpStart+4:], uint16(udpHeaderLen+len(payload))) // length
 
 	// Copy payload
