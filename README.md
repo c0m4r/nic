@@ -31,15 +31,6 @@ sudo make install-sysv       # SysV init
 sudo make install-runit      # runit
 ```
 
-Or install the init system from within nic:
-
-```sh
-sudo nic install systemd
-sudo nic install openrc
-sudo nic install sysv
-sudo nic install runit
-```
-
 ## Usage
 
 ```
