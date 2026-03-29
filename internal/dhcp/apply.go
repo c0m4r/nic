@@ -14,8 +14,8 @@ const dhcpMetric = "1002"
 func applyLease(iface string, lease *Lease) error {
 	cidr := lease.CIDR()
 
-	// Add IP address with lifetime
-	addrArgs := []string{"addr", "add", cidr, "dev", iface}
+	// Set IP address with lifetime (replace is idempotent — add or update)
+	addrArgs := []string{"addr", "replace", cidr, "dev", iface}
 	if lease.LeaseTime > 0 {
 		lt := fmt.Sprintf("%d", lease.LeaseTime)
 		preferred := lt
@@ -40,7 +40,7 @@ func applyLease(iface string, lease *Lease) error {
 		// reachable. Add a host route to the gateway with scope link first.
 		if ones == 32 {
 			fmt.Printf("%s: adding host route to %s\n", iface, lease.Router)
-			_, _ = executor.RunIP("route", "add", lease.Router,
+			_, _ = executor.RunIP("route", "replace", lease.Router,
 				"dev", iface,
 				"proto", "dhcp",
 				"scope", "link",
@@ -49,7 +49,7 @@ func applyLease(iface string, lease *Lease) error {
 		}
 
 		fmt.Printf("%s: adding default route via %s\n", iface, lease.Router)
-		_, _ = executor.RunIP("route", "add", "default",
+		_, _ = executor.RunIP("route", "replace", "default",
 			"via", lease.Router,
 			"dev", iface,
 			"proto", "dhcp",
@@ -93,7 +93,7 @@ func unapplyLease(iface string, lease *Lease) {
 func applyLeaseV6(iface string, lease *LeaseV6) error {
 	for _, addr := range lease.Addresses {
 		cidr := fmt.Sprintf("%s/%d", addr.IP, addr.PrefixLen)
-		addrArgs := []string{"addr", "add", cidr, "dev", iface}
+		addrArgs := []string{"addr", "replace", cidr, "dev", iface}
 		if addr.ValidLife > 0 {
 			addrArgs = append(addrArgs,
 				"valid_lft", fmt.Sprintf("%d", addr.ValidLife),

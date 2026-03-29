@@ -57,28 +57,34 @@ func main() {
 
 	switch cmd {
 	case "start":
+		fmt.Printf("Starting nic v%s...\n", version)
 		if err := cmdStart(configPath); err != nil {
 			fatal(err)
 		}
 	case "stop":
+		fmt.Printf("Stopping nic v%s...\n", version)
 		if err := cmdStop(configPath, cmdArgs); err != nil {
 			fatal(err)
 		}
 	case "restart":
+		fmt.Printf("Restarting nic v%s...\n", version)
 		if err := cmdRestart(configPath, cmdArgs); err != nil {
 			fatal(err)
 		}
 	case "reload":
+		fmt.Printf("Reloading nic v%s...\n", version)
 		if err := cmdReload(configPath, cmdArgs); err != nil {
 			fatal(err)
 		}
 	case "status":
 		cmdStatus()
 	case "show":
+		fmt.Printf("nic v%s | show\n", version)
 		if err := cmdShow(configPath); err != nil {
 			fatal(err)
 		}
 	case "dry-run":
+		fmt.Printf("nic v%s | dry-run mode\n", version)
 		if err := cmdDryRun(configPath); err != nil {
 			fatal(err)
 		}
@@ -213,10 +219,7 @@ func applyConfig(cfg *config.Config) error {
 			// Resolve aliases in the ip arguments
 			ipArgs = mgr.ResolveInTokens(ipArgs)
 			if _, err := executor.RunIP(ipArgs...); err != nil {
-				// Some errors are benign (e.g., address already exists)
-				errStr := err.Error()
-				if strings.Contains(errStr, "File exists") ||
-					strings.Contains(errStr, "RTNETLINK answers: File exists") {
+				if isAlreadyExists(err) {
 					if executor.Verbose {
 						fmt.Printf("  (already exists, skipping)\n")
 					}
@@ -518,6 +521,14 @@ func cmdConfirm() error {
 	}
 	fmt.Println(color.Green("Changes confirmed."))
 	return nil
+}
+
+// isAlreadyExists reports whether an ip command error indicates the object
+// already exists (EEXIST from the kernel). This covers all iproute2 objects
+// generically without hardcoding which ones support "replace".
+func isAlreadyExists(err error) bool {
+	s := strings.ToLower(err.Error())
+	return strings.Contains(s, "file exists") || strings.Contains(s, "already assigned")
 }
 
 // --- Helper functions ---

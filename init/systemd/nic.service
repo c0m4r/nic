@@ -9,7 +9,7 @@ After=local-fs.target systemd-udevd.service
 Type=oneshot
 RemainAfterExit=yes
 ExecStart=/usr/local/sbin/nic start
-ExecStop=/usr/local/sbin/nic stop
+ExecStop=/usr/local/sbin/nic stop --force
 ExecReload=/usr/local/sbin/nic reload --force
 
 [Install]

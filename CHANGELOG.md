@@ -7,7 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 Types of changes: Added, Changed, Deprecated, Removed, Fixed, Security
 
-## [0.1.1] - 2026-03-025
+## [0.1.2] - 2026-03-29
+
+### Fixed
+
+- Restart/reload handling
+
+## [0.1.1] - 2026-03-25
 
 ### Fixed
 

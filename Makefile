@@ -1,6 +1,6 @@
 .PHONY: build install clean install-systemd install-openrc install-sysv install-runit
 
-VERSION := 0.1.1
+VERSION := 0.1.2
 LDFLAGS := -ldflags "-s -w -X main.version=$(VERSION)"
 PREFIX  := /usr/local
 
