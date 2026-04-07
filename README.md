@@ -34,25 +34,29 @@ sudo make install-runit      # runit
 ## Usage
 
 ```
-nic <command> [options]
+nic - network interface configurator
+
+Usage: nic <command> [options]
 
 Commands:
-  start                 Apply network configuration
-  stop                  Tear down network configuration
-  restart [options]     Stop and re-apply (with revert safety)
-  reload [options]      Re-apply showing diff of changes
-  status                Show current network state
-  show                  Display parsed configuration
-  dry-run               Show what would be done without applying
-  confirm               Confirm changes after restart/reload
-  install <init>        Install init scripts (systemd|openrc|sysv|runit)
-  version               Show version
+  start                  Apply network configuration
+  stop                   Tear down network configuration
+  restart [options]      Stop and re-apply configuration
+  reload  [options]      Re-apply configuration (shows diff)
+  status                 Show current network state
+  show                   Show parsed configuration
+  dry-run                Show what would be done without applying
+  confirm                Confirm changes after reload/restart with timeout
+  version                Show version
 
 Options:
-  --config=PATH         Config file (default: /etc/nic.conf)
-  --verbose, -v         Show commands being executed
-  --confirm-timeout=N   Seconds before automatic revert (default: 10)
-  --force               Skip confirmation prompts
+  --config=PATH          Config file path (default: /etc/nic.conf)
+  --verbose, -v          Show commands being executed
+  --confirm-timeout=N    Revert after N seconds if not confirmed (default: 10)
+  --daemon, -d           Run in daemon mode (keeps DHCP clients running)
+  --force                Skip confirmation prompts
+  --help, -h             Show this help
+  --version, -V          Show version
 ```
 
 ## Configuration

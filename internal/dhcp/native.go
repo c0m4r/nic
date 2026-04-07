@@ -27,7 +27,7 @@ var (
 	nativeClientsMu sync.Mutex
 )
 
-func startNative(iface string) error {
+func startNative(iface string, daemonMode bool) error {
 	stopNativeKey(iface)
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -71,11 +71,17 @@ func startNative(iface string) error {
 	nc.mu.Unlock()
 	_ = v4lease.save()
 
-	go nc.renewLoop(ctx)
+	if daemonMode {
+		go nc.renewLoop(ctx)
+	} else {
+		// Oneshot mode: cancel context immediately after acquiring lease
+		// This stops the renewal loop but keeps the lease applied
+		cancel()
+	}
 	return nil
 }
 
-func startNativeV6(iface string) error {
+func startNativeV6(iface string, daemonMode bool) error {
 	key := iface + ":6"
 	stopNativeKey(key)
 
@@ -124,7 +130,12 @@ func startNativeV6(iface string) error {
 			iface, addr.IP, addr.PrefixLen, addr.ValidLife)
 	}
 
-	go nc.renewLoop(ctx)
+	if daemonMode {
+		go nc.renewLoop(ctx)
+	} else {
+		// Oneshot mode: cancel context immediately after acquiring lease
+		cancel()
+	}
 	return nil
 }
 

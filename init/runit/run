@@ -1,2 +1,2 @@
 #!/bin/sh
-exec /usr/local/sbin/nic start
+exec /usr/local/sbin/nic start --daemon

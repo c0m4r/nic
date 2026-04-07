@@ -11,7 +11,8 @@ const pidDir = "/run/nic/dhcp"
 // Start launches a DHCPv4 client for the given interface.
 // If preferredClient is empty, uses the native client.
 // If preferredClient is "dhclient", "dhcpcd", or "udhcpc", uses that external client.
-func Start(iface, preferredClient string) error {
+// In daemon mode, native client stays running to renew leases; otherwise it's oneshot.
+func Start(iface, preferredClient string, daemonMode bool) error {
 	_ = Stop(iface)
 
 	if executor.DryRun {
@@ -27,17 +28,17 @@ func Start(iface, preferredClient string) error {
 		return startExternal(iface, preferredClient)
 	}
 
-	return startNative(iface)
+	return startNative(iface, daemonMode)
 }
 
 // StartV6 launches a DHCPv6 client for the given interface.
-func StartV6(iface string) error {
+func StartV6(iface string, daemonMode bool) error {
 	if executor.DryRun {
 		fmt.Printf("[dry-run] start dhcp v6 (native) on %s\n", iface)
 		return nil
 	}
 
-	return startNativeV6(iface)
+	return startNativeV6(iface, daemonMode)
 }
 
 // Stop kills the DHCP client running on the given interface.

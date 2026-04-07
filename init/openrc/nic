@@ -2,6 +2,8 @@
 
 description="nic - network interface configurator"
 command="/usr/local/sbin/nic"
+command_args="start --daemon"
+pidfile="/run/nic/nic.pid"
 
 depend() {
     need localmount
@@ -12,7 +14,7 @@ depend() {
 
 start() {
     ebegin "Starting nic"
-    ${command} start
+    ${command} ${command_args}
     eend $?
 }
 

@@ -13,7 +13,7 @@ NIC="/usr/local/sbin/nic"
 case "$1" in
     start)
         echo "Starting nic..."
-        $NIC start
+        $NIC start --daemon
         ;;
     stop)
         echo "Stopping nic..."
@@ -22,7 +22,7 @@ case "$1" in
     restart)
         echo "Restarting nic..."
         $NIC stop
-        $NIC start
+        $NIC start --daemon
         ;;
     reload)
         echo "Reloading nic..."

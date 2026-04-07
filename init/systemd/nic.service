@@ -6,11 +6,12 @@ Before=network.target network-online.target
 After=local-fs.target systemd-udevd.service
 
 [Service]
-Type=oneshot
-RemainAfterExit=yes
-ExecStart=/usr/local/sbin/nic start
+Type=simple
+ExecStart=/usr/local/sbin/nic start --daemon
 ExecStop=/usr/local/sbin/nic stop --force
 ExecReload=/usr/local/sbin/nic reload --force
+Restart=on-failure
+RestartSec=5
 
 [Install]
 WantedBy=multi-user.target

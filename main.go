@@ -4,8 +4,11 @@ import (
 	"bufio"
 	"fmt"
 	"os"
+	"os/signal"
+	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/c0m4r/nic/internal/alias"
@@ -57,8 +60,14 @@ func main() {
 
 	switch cmd {
 	case "start":
+		daemonMode := false
+		for _, arg := range cmdArgs {
+			if arg == "--daemon" || arg == "-d" {
+				daemonMode = true
+			}
+		}
 		fmt.Printf("Starting nic v%s...\n", version)
-		if err := cmdStart(configPath); err != nil {
+		if err := cmdStart(configPath, daemonMode); err != nil {
 			fatal(err)
 		}
 	case "stop":
@@ -128,6 +137,7 @@ Options:
   --config=PATH          Config file path (default: /etc/nic.conf)
   --verbose, -v          Show commands being executed
   --confirm-timeout=N    Revert after N seconds if not confirmed (default: 10)
+  --daemon, -d           Run in daemon mode (keeps DHCP clients running)
   --force                Skip confirmation prompts
   --help, -h             Show this help
   --version, -V          Show version
@@ -136,16 +146,29 @@ Options:
 
 // --- Command implementations ---
 
-func cmdStart(configPath string) error {
+func cmdStart(configPath string, daemonMode bool) error {
 	cfg, err := config.Load(configPath)
 	if err != nil {
 		return fmt.Errorf("load config: %w", err)
 	}
 
-	return applyConfig(cfg)
+	if err := applyConfig(cfg, daemonMode); err != nil {
+		return err
+	}
+
+	if daemonMode {
+		// Write PID file for daemon mode
+		if err := writePIDFile(); err != nil {
+			fmt.Fprintf(os.Stderr, "warning: could not write PID file: %v\n", err)
+		}
+		fmt.Println("Running in daemon mode. Press Ctrl+C to stop.")
+		waitForShutdownSignal()
+	}
+
+	return nil
 }
 
-func applyConfig(cfg *config.Config) error {
+func applyConfig(cfg *config.Config, daemonMode bool) error {
 	mgr := alias.NewManager()
 	var nameservers []string
 
@@ -198,7 +221,7 @@ func applyConfig(cfg *config.Config) error {
 			if len(cmd.Tokens) >= 3 {
 				client = cmd.Tokens[2]
 			}
-			if err := dhcp.Start(iface, client); err != nil {
+			if err := dhcp.Start(iface, client, daemonMode); err != nil {
 				return fmt.Errorf("%s:%d: %w", cmd.File, cmd.LineNum, err)
 			}
 
@@ -207,7 +230,7 @@ func applyConfig(cfg *config.Config) error {
 			if resolved, ok := mgr.Get(iface); ok {
 				iface = resolved
 			}
-			if err := dhcp.StartV6(iface); err != nil {
+			if err := dhcp.StartV6(iface, daemonMode); err != nil {
 				return fmt.Errorf("%s:%d: %w", cmd.File, cmd.LineNum, err)
 			}
 
@@ -401,7 +424,7 @@ func cmdRestart(configPath string, cmdArgs []string) error {
 	}
 
 	// Start
-	if err := cmdStart(configPath); err != nil {
+	if err := cmdStart(configPath, false); err != nil {
 		return err
 	}
 
@@ -464,7 +487,7 @@ func cmdReload(configPath string, cmdArgs []string) error {
 	}
 
 	// Apply
-	if err := applyConfig(cfg); err != nil {
+	if err := applyConfig(cfg, false); err != nil {
 		return err
 	}
 
@@ -512,7 +535,7 @@ func cmdDryRun(configPath string) error {
 	if err != nil {
 		return fmt.Errorf("load config: %w", err)
 	}
-	return applyConfig(cfg)
+	return applyConfig(cfg, false)
 }
 
 func cmdConfirm() error {
@@ -564,4 +587,29 @@ func confirm() bool {
 	input, _ := reader.ReadString('\n')
 	input = strings.TrimSpace(strings.ToLower(input))
 	return input == "y" || input == "yes"
+}
+
+// waitForShutdownSignal blocks until SIGINT or SIGTERM is received,
+// then triggers graceful shutdown by stopping all DHCP clients.
+func waitForShutdownSignal() {
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+	<-sigChan
+
+	fmt.Println("\nShutting down gracefully...")
+	dhcp.StopAll()
+
+	// Remove PID file on shutdown
+	_ = os.Remove("/run/nic/nic.pid")
+}
+
+// writePIDFile writes the current process PID to /run/nic/nic.pid
+func writePIDFile() error {
+	pidDir := "/run/nic"
+	if err := os.MkdirAll(pidDir, 0755); err != nil {
+		return err
+	}
+
+	pid := os.Getpid()
+	return os.WriteFile(filepath.Join(pidDir, "nic.pid"), []byte(fmt.Sprintf("%d\n", pid)), 0644)
 }
