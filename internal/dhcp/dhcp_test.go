@@ -1,9 +1,16 @@
 package dhcp
 
 import (
+	"context"
 	"encoding/binary"
+	"errors"
 	"net"
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
+
+	"github.com/c0m4r/nic/internal/executor"
 )
 
 func TestV4PacketRoundTrip(t *testing.T) {
@@ -33,6 +40,101 @@ func TestV4PacketRoundTrip(t *testing.T) {
 	}
 	if net.HardwareAddr(pkt.CHAddr[:6]).String() != mac.String() {
 		t.Errorf("CHAddr = %s, want %s", pkt.CHAddr[:6], mac)
+	}
+}
+
+func TestStartFallsBackToExternalClient(t *testing.T) {
+	oldNative := nativeStarter
+	oldExternal := externalStarter
+	oldDetector := externalDetector
+	defer func() {
+		nativeStarter = oldNative
+		externalStarter = oldExternal
+		externalDetector = oldDetector
+	}()
+	t.Setenv("PATH", t.TempDir())
+
+	nativeStarter = func(string, bool) error { return errors.New("native failed") }
+	externalDetector = func() string { return "dhclient" }
+	called := ""
+	externalStarter = func(_ string, client string) error {
+		called = client
+		return nil
+	}
+	if err := Start("eth0", "", false); err != nil {
+		t.Fatal(err)
+	}
+	if called != "dhclient" {
+		t.Fatalf("fallback client = %q", called)
+	}
+}
+
+func TestFinishOneShotRemovesClientAndClosesDone(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	_ = ctx
+	nc := &nativeClient{iface: "eth0", cancel: cancel, done: make(chan struct{})}
+	nativeClientsMu.Lock()
+	nativeClients["eth0"] = nc
+	nativeClientsMu.Unlock()
+	finishOneShot("eth0", nc)
+
+	nativeClientsMu.Lock()
+	_, exists := nativeClients["eth0"]
+	nativeClientsMu.Unlock()
+	if exists {
+		t.Fatal("one-shot client remained registered")
+	}
+	select {
+	case <-nc.done:
+	default:
+		t.Fatal("one-shot completion channel was not closed")
+	}
+}
+
+func TestApplyLeaseReturnsRouteFailure(t *testing.T) {
+	dir := t.TempDir()
+	script := `#!/bin/sh
+case "$*" in
+  *"route replace default"*) echo route-denied >&2; exit 1 ;;
+esac
+exit 0
+`
+	if err := os.WriteFile(filepath.Join(dir, "ip"), []byte(script), 0755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir)
+	executor.DryRun = false
+	lease := &Lease{
+		IP: "192.0.2.10", SubnetMask: "255.255.255.0", Router: "192.0.2.1",
+		LeaseTime: 3600,
+	}
+	if err := applyLease("eth0", lease); err == nil || !strings.Contains(err.Error(), "route-denied") {
+		t.Fatalf("applyLease error = %v", err)
+	}
+}
+
+func TestDUIDPersistsAcrossCalls(t *testing.T) {
+	original := duidFilePath
+	duidFilePath = filepath.Join(t.TempDir(), "duid")
+	defer func() { duidFilePath = original }()
+
+	first, err := loadOrCreateDUID(net.HardwareAddr{0, 1, 2, 3, 4, 5})
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := loadOrCreateDUID(net.HardwareAddr{6, 7, 8, 9, 10, 11})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(first.raw) != string(second.raw) {
+		t.Fatal("persisted DUID changed")
+	}
+	info, err := os.Stat(duidFilePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm() != 0600 {
+		t.Fatalf("DUID mode = %o", info.Mode().Perm())
 	}
 }
 

@@ -8,28 +8,28 @@
 # Short-Description: nic network interface configurator
 ### END INIT INFO
 
-NIC="/usr/local/sbin/nic"
+NIC="@PREFIX@/sbin/nic"
 
 case "$1" in
     start)
         echo "Starting nic..."
-        $NIC start --daemon
+        "$NIC" start --daemon >/var/log/nic.log 2>&1 &
         ;;
     stop)
         echo "Stopping nic..."
-        $NIC stop
+        "$NIC" stop --force
         ;;
     restart)
         echo "Restarting nic..."
-        $NIC stop
-        $NIC start --daemon
+        "$NIC" stop --force
+        "$NIC" start --daemon >/var/log/nic.log 2>&1 &
         ;;
     reload)
         echo "Reloading nic..."
-        $NIC reload --force
+        "$NIC" reload --force --no-rollback
         ;;
     status)
-        $NIC status
+        "$NIC" status
         ;;
     *)
         echo "Usage: $0 {start|stop|restart|reload|status}"

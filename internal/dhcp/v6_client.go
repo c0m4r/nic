@@ -1,6 +1,7 @@
 package dhcp
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"math/rand/v2"
@@ -26,14 +27,13 @@ func runDHCPv6(ctx context.Context, iface string) (*LeaseV6, error) {
 		return nil, err
 	}
 
-	duid := newDUID(mac)
+	duid, err := loadOrCreateDUID(mac)
+	if err != nil {
+		return nil, fmt.Errorf("load DHCPv6 client identity: %w", err)
+	}
 	iaid := computeIAID(iface)
 
-	var txID [3]byte
-	r := rand.Uint32()
-	txID[0] = byte(r >> 16)
-	txID[1] = byte(r >> 8)
-	txID[2] = byte(r)
+	txID := randomTxID()
 
 	conn, err := net.ListenPacket("udp6", "[::]:546")
 	if err != nil {
@@ -48,7 +48,7 @@ func runDHCPv6(ctx context.Context, iface string) (*LeaseV6, error) {
 	}
 
 	// REQUEST
-	lease, err := doRequestV6(ctx, conn, duid, serverDUID, iaid, txID, addrs, iface)
+	lease, err := doRequestV6(ctx, conn, duid, serverDUID, iaid, randomTxID(), addrs, iface)
 	if err != nil {
 		return nil, err
 	}
@@ -92,6 +92,9 @@ func doSolicit(ctx context.Context, conn net.PacketConn, duid v6DUID, iaid uint3
 
 		serverDUID := msg.getOption(optV6ServerID)
 		if serverDUID == nil {
+			continue
+		}
+		if clientID := msg.getOption(optV6ClientID); clientID == nil || !bytes.Equal(clientID, duid.raw) {
 			continue
 		}
 
@@ -144,24 +147,34 @@ func doRequestV6(ctx context.Context, conn net.PacketConn, clientDUID v6DUID, se
 		if msg.TransactionID != txID {
 			continue
 		}
+		if !bytes.Equal(msg.getOption(optV6ClientID), clientDUID.raw) ||
+			!bytes.Equal(msg.getOption(optV6ServerID), serverDUID) {
+			continue
+		}
 
-		return parseLeaseV6(iface, msg, serverDUID, iaid)
+		return parseLeaseV6(iface, msg, serverDUID, iaid, clientDUID)
 	}
 
 	return nil, fmt.Errorf("no DHCPv6 reply received")
 }
 
-func parseLeaseV6(iface string, msg *v6Message, serverDUID []byte, iaid uint32) (*LeaseV6, error) {
+func parseLeaseV6(iface string, msg *v6Message, serverDUID []byte, iaid uint32, clientDUID v6DUID) (*LeaseV6, error) {
 	lease := &LeaseV6{
 		Interface:  iface,
 		ServerDUID: serverDUID,
+		ClientDUID: append([]byte(nil), clientDUID.raw...),
 		IAID:       iaid,
 		AcquiredAt: time.Now(),
 	}
 
 	ianaData := msg.getOption(optV6IANA)
 	if ianaData != nil {
-		_, _, _, addrs := parseIANA(ianaData)
+		parsedIAID, t1, t2, addrs := parseIANA(ianaData)
+		if parsedIAID != iaid {
+			return nil, fmt.Errorf("DHCPv6 reply has IAID %d, want %d", parsedIAID, iaid)
+		}
+		lease.RenewTime = t1
+		lease.RebindTime = t2
 		for _, a := range addrs {
 			lease.Addresses = append(lease.Addresses, V6Addr{
 				IP:            a.IP.String(),
@@ -191,11 +204,7 @@ func renewLeaseV6(iface string, lease *LeaseV6, clientDUID v6DUID) (*LeaseV6, er
 	}
 	defer func() { _ = conn.Close() }()
 
-	var txID [3]byte
-	r := rand.Uint32()
-	txID[0] = byte(r >> 16)
-	txID[1] = byte(r >> 8)
-	txID[2] = byte(r)
+	txID := randomTxID()
 
 	var addrs []iaAddrInfo
 	for _, a := range lease.Addresses {
@@ -231,8 +240,13 @@ func renewLeaseV6(iface string, lease *LeaseV6, clientDUID v6DUID) (*LeaseV6, er
 	if msg.Type != msgV6Reply {
 		return nil, fmt.Errorf("unexpected v6 message type %d", msg.Type)
 	}
+	if msg.TransactionID != txID ||
+		!bytes.Equal(msg.getOption(optV6ClientID), clientDUID.raw) ||
+		!bytes.Equal(msg.getOption(optV6ServerID), lease.ServerDUID) {
+		return nil, fmt.Errorf("DHCPv6 renewal reply identity mismatch")
+	}
 
-	return parseLeaseV6(iface, msg, lease.ServerDUID, lease.IAID)
+	return parseLeaseV6(iface, msg, lease.ServerDUID, lease.IAID, clientDUID)
 }
 
 // waitForLinkLocal waits for a non-tentative link-local address on the interface.
@@ -281,6 +295,15 @@ func computeIAID(iface string) uint32 {
 		h = h*31 + uint32(c)
 	}
 	return h
+}
+
+func randomTxID() [3]byte {
+	var txID [3]byte
+	value := rand.Uint32()
+	txID[0] = byte(value >> 16)
+	txID[1] = byte(value >> 8)
+	txID[2] = byte(value)
+	return txID
 }
 
 func min(a, b time.Duration) time.Duration {

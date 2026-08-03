@@ -2,12 +2,15 @@ package state
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"strings"
 
 	"github.com/c0m4r/nic/internal/color"
+	"github.com/c0m4r/nic/internal/dns"
 	"github.com/c0m4r/nic/internal/executor"
 )
 
@@ -19,6 +22,7 @@ type Interface struct {
 	Address   string   `json:"address"`
 	OperState string   `json:"operstate"`
 	Link      string   `json:"link_type"`
+	Master    string   `json:"master,omitempty"`
 }
 
 type AddrEntry struct {
@@ -43,19 +47,31 @@ type Route struct {
 	Protocol string `json:"protocol"`
 	Scope    string `json:"scope"`
 	Metric   int    `json:"metric"`
+	Table    any    `json:"table,omitempty"`
+	Type     string `json:"type,omitempty"`
+	PrefSrc  string `json:"prefsrc,omitempty"`
+	Src      string `json:"src,omitempty"`
 }
 
 // NetworkState holds a snapshot of the network configuration.
 type NetworkState struct {
-	Interfaces []Interface `json:"interfaces"`
-	Addresses  []AddrEntry `json:"addresses"`
-	Routes     []Route     `json:"routes"`
-	Routes6    []Route     `json:"routes6"`
+	Interfaces  []Interface  `json:"interfaces"`
+	Addresses   []AddrEntry  `json:"addresses"`
+	Routes      []Route      `json:"routes"`
+	Routes6     []Route      `json:"routes6"`
+	RouteLines  []string     `json:"route_lines,omitempty"`
+	Route6Lines []string     `json:"route6_lines,omitempty"`
+	RuleLines   []string     `json:"rule_lines,omitempty"`
+	Rule6Lines  []string     `json:"rule6_lines,omitempty"`
+	DNS         dns.Snapshot `json:"dns"`
 }
 
 // GetInterfaces returns all network interfaces.
 func GetInterfaces() ([]Interface, error) {
-	output := executor.RunSilent("ip", "-j", "link", "show")
+	output, runErr := executor.RunQuiet("ip", "-j", "link", "show")
+	if runErr != nil {
+		return nil, runErr
+	}
 	if output == "" {
 		return nil, fmt.Errorf("failed to get interfaces")
 	}
@@ -68,7 +84,10 @@ func GetInterfaces() ([]Interface, error) {
 
 // GetAddresses returns all addresses on all interfaces.
 func GetAddresses() ([]AddrEntry, error) {
-	output := executor.RunSilent("ip", "-j", "addr", "show")
+	output, runErr := executor.RunQuiet("ip", "-j", "addr", "show")
+	if runErr != nil {
+		return nil, runErr
+	}
 	if output == "" {
 		return nil, fmt.Errorf("failed to get addresses")
 	}
@@ -81,7 +100,10 @@ func GetAddresses() ([]AddrEntry, error) {
 
 // GetRoutes returns IPv4 routes.
 func GetRoutes() ([]Route, error) {
-	output := executor.RunSilent("ip", "-j", "route", "show")
+	output, runErr := executor.RunQuiet("ip", "-j", "route", "show", "table", "all")
+	if runErr != nil {
+		return nil, runErr
+	}
 	if output == "" {
 		return nil, fmt.Errorf("failed to get routes")
 	}
@@ -94,7 +116,10 @@ func GetRoutes() ([]Route, error) {
 
 // GetRoutes6 returns IPv6 routes.
 func GetRoutes6() ([]Route, error) {
-	output := executor.RunSilent("ip", "-j", "-6", "route", "show")
+	output, runErr := executor.RunQuiet("ip", "-j", "-6", "route", "show", "table", "all")
+	if runErr != nil {
+		return nil, runErr
+	}
 	if output == "" {
 		return nil, fmt.Errorf("failed to get ipv6 routes")
 	}
@@ -107,17 +132,42 @@ func GetRoutes6() ([]Route, error) {
 
 // Capture takes a full snapshot of current network state.
 func Capture() (*NetworkState, error) {
-	ifaces, _ := GetInterfaces()
-	addrs, _ := GetAddresses()
-	routes, _ := GetRoutes()
-	routes6, _ := GetRoutes6()
+	ifaces, ifacesErr := GetInterfaces()
+	addrs, addrsErr := GetAddresses()
+	routes, routesErr := GetRoutes()
+	routes6, routes6Err := GetRoutes6()
+	routeLines, routeLinesErr := captureLines("ip", "-o", "route", "show", "table", "all")
+	route6Lines, route6LinesErr := captureLines("ip", "-o", "-6", "route", "show", "table", "all")
+	ruleLines, ruleLinesErr := captureLines("ip", "-o", "rule", "show")
+	rule6Lines, rule6LinesErr := captureLines("ip", "-o", "-6", "rule", "show")
+	dnsSnapshot, dnsErr := dns.Capture()
+	if err := errors.Join(ifacesErr, addrsErr, routesErr, routes6Err,
+		routeLinesErr, route6LinesErr, ruleLinesErr, rule6LinesErr, dnsErr); err != nil {
+		return nil, err
+	}
 
 	return &NetworkState{
-		Interfaces: ifaces,
-		Addresses:  addrs,
-		Routes:     routes,
-		Routes6:    routes6,
+		Interfaces:  ifaces,
+		Addresses:   addrs,
+		Routes:      routes,
+		Routes6:     routes6,
+		RouteLines:  routeLines,
+		Route6Lines: route6Lines,
+		RuleLines:   ruleLines,
+		Rule6Lines:  rule6Lines,
+		DNS:         dnsSnapshot,
 	}, nil
+}
+
+func captureLines(name string, args ...string) ([]string, error) {
+	output, err := executor.RunQuiet(name, args...)
+	if err != nil {
+		return nil, err
+	}
+	if output == "" {
+		return []string{}, nil
+	}
+	return strings.Split(output, "\n"), nil
 }
 
 // SaveState saves network state to a JSON file.
@@ -130,7 +180,31 @@ func SaveState(path string) error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(path, data, 0600)
+	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+		return err
+	}
+	tmp, err := os.CreateTemp(filepath.Dir(path), ".nic-state-*")
+	if err != nil {
+		return err
+	}
+	tmpPath := tmp.Name()
+	defer func() {
+		_ = tmp.Close()
+		_ = os.Remove(tmpPath)
+	}()
+	if err := tmp.Chmod(0600); err != nil {
+		return err
+	}
+	if _, err := tmp.Write(data); err != nil {
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tmpPath, path)
 }
 
 // LoadState loads network state from a JSON file.
@@ -153,14 +227,36 @@ func RestoreState(path string) error {
 		return fmt.Errorf("load state: %w", err)
 	}
 
-	// Flush all addresses and routes (IPv4 + IPv6) on non-loopback interfaces.
+	var restoreErrors []error
+	addError := func(operation string, err error) {
+		if err != nil {
+			restoreErrors = append(restoreErrors, fmt.Errorf("%s: %w", operation, err))
+		}
+	}
+	_, err = executor.RunIP("route", "flush", "table", "all")
+	addError("flush all IPv4 routes", err)
+	_, err = executor.RunIP("-6", "route", "flush", "table", "all")
+	addError("flush all IPv6 routes", err)
+
+	// Bring links down before restoring mutable link properties, then flush all
+	// addresses on non-loopback interfaces.
 	for _, iface := range st.Interfaces {
 		if iface.IfName == "lo" {
 			continue
 		}
-		_, _ = executor.RunIP("route", "flush", "dev", iface.IfName)
-		_, _ = executor.RunIP("-6", "route", "flush", "dev", iface.IfName)
-		_, _ = executor.RunIP("addr", "flush", "dev", iface.IfName)
+		_, _ = executor.RunIP("link", "set", "dev", iface.IfName, "nomaster")
+		_, err := executor.RunIP("link", "set", "dev", iface.IfName, "down")
+		addError("bring down "+iface.IfName, err)
+		_, err = executor.RunIP("addr", "flush", "dev", iface.IfName)
+		addError("flush addresses on "+iface.IfName, err)
+		if iface.Address != "" && iface.Address != "00:00:00:00:00:00" {
+			_, err = executor.RunIP("link", "set", "dev", iface.IfName, "address", iface.Address)
+			addError("restore address on "+iface.IfName, err)
+		}
+		if iface.MTU > 0 {
+			_, err = executor.RunIP("link", "set", "dev", iface.IfName, "mtu", fmt.Sprintf("%d", iface.MTU))
+			addError("restore MTU on "+iface.IfName, err)
+		}
 	}
 
 	// Restore addresses.
@@ -173,16 +269,49 @@ func RestoreState(path string) error {
 				continue // link-local, auto-generated by kernel
 			}
 			cidr := fmt.Sprintf("%s/%d", addr.Local, addr.PrefixLen)
-			_, _ = executor.RunIP("addr", "replace", cidr, "dev", entry.IfName)
+			args := []string{"addr", "replace", cidr, "dev", entry.IfName}
+			if addr.Scope != "" && addr.Scope != "global" && addr.Scope != "universe" {
+				args = append(args, "scope", addr.Scope)
+			}
+			if addr.Label != "" && addr.Label != entry.IfName {
+				args = append(args, "label", addr.Label)
+			}
+			_, err := executor.RunIP(args...)
+			addError("restore address "+cidr, err)
 		}
 	}
 
 	// Restore IPv4 routes. Add link-scoped (host) routes first so that
 	// gateway routes that depend on them resolve correctly.
-	restoreRoutes(false, st.Routes)
+	if st.RouteLines != nil {
+		addError("restore IPv4 routes", restoreRouteLines(false, st.RouteLines))
+	} else {
+		addError("restore IPv4 routes", restoreRoutes(false, st.Routes))
+	}
 
 	// Restore IPv6 routes (were not restored at all before this fix).
-	restoreRoutes(true, st.Routes6)
+	if st.Route6Lines != nil {
+		addError("restore IPv6 routes", restoreRouteLines(true, st.Route6Lines))
+	} else {
+		addError("restore IPv6 routes", restoreRoutes(true, st.Routes6))
+	}
+	addError("restore IPv4 rules", restoreRules(false, st.RuleLines))
+	addError("restore IPv6 rules", restoreRules(true, st.Rule6Lines))
+
+	// Restore master relationships after all expected links exist.
+	for _, iface := range st.Interfaces {
+		if iface.IfName == "lo" {
+			continue
+		}
+		args := []string{"link", "set", "dev", iface.IfName, "nomaster"}
+		if iface.Master != "" {
+			args = []string{"link", "set", "dev", iface.IfName, "master", iface.Master}
+		}
+		_, err := executor.RunIP(args...)
+		if err != nil && iface.Master != "" {
+			addError("restore master for "+iface.IfName, err)
+		}
+	}
 
 	// Restore interface link states.
 	for _, iface := range st.Interfaces {
@@ -196,15 +325,105 @@ func RestoreState(path string) error {
 				break
 			}
 		}
-		_, _ = executor.RunIP("link", "set", iface.IfName, ifState)
+		_, err := executor.RunIP("link", "set", "dev", iface.IfName, ifState)
+		addError("restore link state for "+iface.IfName, err)
 	}
 
+	addError("restore DNS", dns.Restore(st.DNS))
+	return errors.Join(restoreErrors...)
+}
+
+func restoreRouteLines(v6 bool, lines []string) error {
+	var routeErrors []error
+	for _, line := range lines {
+		fields := strings.Fields(strings.TrimSpace(line))
+		if len(fields) == 0 || containsPair(fields, "proto", "kernel") {
+			continue
+		}
+		args := make([]string, 0, len(fields)+3)
+		if v6 {
+			args = append(args, "-6")
+		}
+		args = append(args, "route", "replace")
+		args = append(args, fields...)
+		if _, err := executor.RunIP(args...); err != nil {
+			routeErrors = append(routeErrors, fmt.Errorf("route %q: %w", line, err))
+		}
+	}
+	return errors.Join(routeErrors...)
+}
+
+func restoreRules(v6 bool, desired []string) error {
+	if desired == nil {
+		return nil
+	}
+	current, err := captureLines("ip", append(familyArgs(v6), "-o", "rule", "show")...)
+	if err != nil {
+		return err
+	}
+	var ruleErrors []error
+	for _, line := range current {
+		priority, _, ok := splitRuleLine(line)
+		if !ok || isDefaultRulePriority(priority) {
+			continue
+		}
+		args := append(familyArgs(v6), "rule", "del", "priority", priority)
+		if _, err := executor.RunIP(args...); err != nil {
+			ruleErrors = append(ruleErrors, err)
+		}
+	}
+	for _, line := range desired {
+		priority, body, ok := splitRuleLine(line)
+		if !ok || isDefaultRulePriority(priority) {
+			continue
+		}
+		args := append(familyArgs(v6), "rule", "add", "priority", priority)
+		args = append(args, strings.Fields(body)...)
+		if _, err := executor.RunIP(args...); err != nil {
+			ruleErrors = append(ruleErrors, fmt.Errorf("rule %q: %w", line, err))
+		}
+	}
+	return errors.Join(ruleErrors...)
+}
+
+func familyArgs(v6 bool) []string {
+	if v6 {
+		return []string{"-6"}
+	}
 	return nil
+}
+
+func splitRuleLine(line string) (string, string, bool) {
+	before, after, ok := strings.Cut(strings.TrimSpace(line), ":")
+	priority := strings.TrimSpace(before)
+	if !ok || priority == "" {
+		return "", "", false
+	}
+	for _, r := range priority {
+		if r < '0' || r > '9' {
+			return "", "", false
+		}
+	}
+	return priority, strings.TrimSpace(after), true
+}
+
+func isDefaultRulePriority(priority string) bool {
+	return priority == "0" || priority == "32766" || priority == "32767"
+}
+
+func containsPair(fields []string, first, second string) bool {
+	for i := 0; i+1 < len(fields); i++ {
+		if fields[i] == first && fields[i+1] == second {
+			return true
+		}
+	}
+	return false
 }
 
 // restoreRoutes replays a slice of routes, skipping kernel-generated ones and
 // adding link-scoped routes before gateway routes so dependencies are met.
-func restoreRoutes(v6 bool, routes []Route) {
+func restoreRoutes(v6 bool, routes []Route) error {
+	var routeErrors []error
 	// Two passes: link-scoped first, then the rest.
 	for _, pass := range []string{"link", ""} {
 		for _, r := range routes {
@@ -217,9 +436,12 @@ func restoreRoutes(v6 bool, routes []Route) {
 			if pass == "" && r.Scope == "link" {
 				continue
 			}
-			_ = applyRoute(v6, r)
+			if err := applyRoute(v6, r); err != nil {
+				routeErrors = append(routeErrors, err)
+			}
 		}
 	}
+	return errors.Join(routeErrors...)
 }
 
 func applyRoute(v6 bool, r Route) error {
@@ -228,6 +450,9 @@ func applyRoute(v6 bool, r Route) error {
 		args = append(args, "-6")
 	}
 	args = append(args, "route", "replace")
+	if r.Type != "" && r.Type != "unicast" {
+		args = append(args, r.Type)
+	}
 
 	if r.Dst == "" || r.Dst == "default" {
 		args = append(args, "default")
@@ -240,6 +465,11 @@ func applyRoute(v6 bool, r Route) error {
 	if r.Dev != "" {
 		args = append(args, "dev", r.Dev)
 	}
+	if r.PrefSrc != "" {
+		args = append(args, "src", r.PrefSrc)
+	} else if r.Src != "" {
+		args = append(args, "src", r.Src)
+	}
 	if r.Protocol != "" && r.Protocol != "boot" {
 		args = append(args, "proto", r.Protocol)
 	}
@@ -249,9 +479,25 @@ func applyRoute(v6 bool, r Route) error {
 	if r.Metric > 0 {
 		args = append(args, "metric", fmt.Sprintf("%d", r.Metric))
 	}
+	if table := formatTable(r.Table); table != "" && table != "main" && table != "254" {
+		args = append(args, "table", table)
+	}
 
 	_, err := executor.RunIP(args...)
 	return err
+}
+
+func formatTable(table any) string {
+	switch value := table.(type) {
+	case nil:
+		return ""
+	case string:
+		return value
+	case float64:
+		return fmt.Sprintf("%.0f", value)
+	default:
+		return fmt.Sprint(value)
+	}
 }
 
 func colorizeState(s string) string {

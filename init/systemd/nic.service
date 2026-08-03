@@ -7,9 +7,9 @@ After=local-fs.target systemd-udevd.service
 
 [Service]
 Type=simple
-ExecStart=/usr/local/sbin/nic start --daemon
-ExecStop=/usr/local/sbin/nic stop --force
-ExecReload=/usr/local/sbin/nic reload --force
+ExecStart=@PREFIX@/sbin/nic start --daemon
+ExecStop=@PREFIX@/sbin/nic stop --force
+ExecReload=@PREFIX@/sbin/nic reload --force --no-rollback
 Restart=on-failure
 RestartSec=5
 

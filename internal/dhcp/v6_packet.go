@@ -4,6 +4,8 @@ import (
 	"encoding/binary"
 	"fmt"
 	"net"
+	"os"
+	"path/filepath"
 	"time"
 )
 
@@ -54,6 +56,8 @@ type v6DUID struct {
 	raw []byte
 }
 
+var duidFilePath = "/var/lib/nic/duid"
+
 // newDUID creates a DUID-LLT from a MAC address.
 func newDUID(mac net.HardwareAddr) v6DUID {
 	// DUID-LLT: type(2) + hw-type(2) + time(4) + link-layer(6) = 14 bytes
@@ -68,6 +72,59 @@ func newDUID(mac net.HardwareAddr) v6DUID {
 	copy(buf[8:14], mac)
 
 	return v6DUID{raw: buf}
+}
+
+func loadOrCreateDUID(mac net.HardwareAddr) (v6DUID, error) {
+	if data, err := os.ReadFile(duidFilePath); err == nil {
+		if len(data) < 4 {
+			return v6DUID{}, fmt.Errorf("stored DHCPv6 DUID is invalid")
+		}
+		return v6DUID{raw: append([]byte(nil), data...)}, nil
+	} else if !os.IsNotExist(err) {
+		return v6DUID{}, err
+	}
+
+	if err := os.MkdirAll(filepath.Dir(duidFilePath), 0700); err != nil {
+		return v6DUID{}, err
+	}
+	duid := newDUID(mac)
+	f, err := os.OpenFile(duidFilePath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
+	if os.IsExist(err) {
+		data, readErr := os.ReadFile(duidFilePath)
+		if readErr != nil {
+			return v6DUID{}, readErr
+		}
+		return v6DUID{raw: append([]byte(nil), data...)}, nil
+	}
+	if err != nil {
+		return v6DUID{}, err
+	}
+	if _, err := f.Write(duid.raw); err != nil {
+		_ = f.Close()
+		_ = os.Remove(duidFilePath)
+		return v6DUID{}, err
+	}
+	if err := f.Sync(); err != nil {
+		_ = f.Close()
+		_ = os.Remove(duidFilePath)
+		return v6DUID{}, err
+	}
+	if err := f.Close(); err != nil {
+		_ = os.Remove(duidFilePath)
+		return v6DUID{}, err
+	}
+	return duid, nil
+}
+
+func leaseDUID(lease *LeaseV6, mac net.HardwareAddr) (v6DUID, error) {
+	if len(lease.ClientDUID) >= 4 {
+		return v6DUID{raw: append([]byte(nil), lease.ClientDUID...)}, nil
+	}
+	duid, err := loadOrCreateDUID(mac)
+	if err == nil {
+		lease.ClientDUID = append([]byte(nil), duid.raw...)
+	}
+	return duid, err
 }
 
 // marshal serializes a DHCPv6 message.

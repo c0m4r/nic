@@ -31,6 +31,13 @@ sudo make install-sysv       # SysV init
 sudo make install-runit      # runit
 ```
 
+The systemd installer does not stop or mask the existing network stack. After
+validating `/etc/nic.conf`, either disable conflicting services yourself or run
+`sudo NIC_DISABLE_SYSTEM_SERVICES=1 make install-systemd`.
+
+For staged/package installs, all targets honor `DESTDIR`; `PREFIX`,
+`SYSCONFDIR`, and init-directory variables can also be overridden.
+
 ## Usage
 
 ```
@@ -53,6 +60,7 @@ Options:
   --config=PATH          Config file path (default: /etc/nic.conf)
   --verbose, -v          Show commands being executed
   --confirm-timeout=N    Revert after N seconds if not confirmed (default: 10)
+  --no-rollback          Apply restart/reload without a confirmation watcher
   --daemon, -d           Run in daemon mode (keeps DHCP clients running)
   --force                Skip confirmation prompts
   --help, -h             Show this help
@@ -124,6 +132,10 @@ dhcp eth0 dhclient     # force specific client
 
 Supports dhclient, dhcpcd, and udhcpc.
 
+The native client is tried first. If it cannot obtain a lease, nic falls back
+to the first installed external client. Specify `native`, `dhclient`,
+`dhcpcd`, or `udhcpc` to force one implementation.
+
 ### WiFi
 
 ```sh
@@ -132,6 +144,10 @@ wifi MyNetwork MyPassword wlan0   # specify interface
 ```
 
 Uses wpa_supplicant or iwd, with WPA3 (SAE) support.
+
+Because the configuration contains the WiFi passphrase, every file containing
+a `wifi` directive must be owned appropriately and have mode `0600`. Passwords
+are supplied to helper programs without placing them in command-line arguments.
 
 ### Aliases and MAC pinning
 
@@ -188,6 +204,12 @@ ns 1.1.1.1
 ## Restart safety
 
 `nic restart` and `nic reload` save the current network state before applying changes. If you don't run `nic confirm` within the timeout (default 10 seconds), the previous state is automatically restored. This prevents locking yourself out over SSH.
+
+`reload` compares the last applied configuration with the desired one, restores
+the pre-nic baseline, and then applies the desired state. Removed addresses,
+routes, links, DNS entries, DHCP sessions, and WiFi connections therefore do
+not linger. Use `--no-rollback` only in automation that intentionally accepts
+the new configuration immediately.
 
 ```sh
 sudo nic restart --confirm-timeout=30

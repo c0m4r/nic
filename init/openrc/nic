@@ -1,9 +1,13 @@
 #!/sbin/openrc-run
 
 description="nic - network interface configurator"
-command="/usr/local/sbin/nic"
+command="@PREFIX@/sbin/nic"
 command_args="start --daemon"
-pidfile="/run/nic/nic.pid"
+supervisor="supervise-daemon"
+respawn_delay=5
+respawn_max=3
+respawn_period=30
+extra_started_commands="reload"
 
 depend() {
     need localmount
@@ -12,20 +16,8 @@ depend() {
     provide net
 }
 
-start() {
-    ebegin "Starting nic"
-    ${command} ${command_args}
-    eend $?
-}
-
-stop() {
-    ebegin "Stopping nic"
-    ${command} stop
-    eend $?
-}
-
 reload() {
     ebegin "Reloading nic"
-    ${command} reload --force
+    "${command}" reload --force --no-rollback
     eend $?
 }

@@ -1,6 +1,7 @@
 package dhcp
 
 import (
+	"bytes"
 	"context"
 	"encoding/binary"
 	"fmt"
@@ -75,7 +76,7 @@ func doDiscover(ctx context.Context, fd int, mac net.HardwareAddr, xid uint32, i
 			return nil, fmt.Errorf("send discover: %w", err)
 		}
 
-		offer, err := recvResponse(fd, xid, msgOffer, timeout)
+		offer, err := recvResponse(ctx, fd, xid, mac, msgOffer, timeout)
 		if err == nil {
 			return offer, nil
 		}
@@ -101,7 +102,7 @@ func doRequest(ctx context.Context, fd int, mac net.HardwareAddr, xid uint32, if
 			return nil, fmt.Errorf("send request: %w", err)
 		}
 
-		ack, err := recvResponse(fd, xid, msgAck, timeout)
+		ack, err := recvResponse(ctx, fd, xid, mac, msgAck, timeout)
 		if err == nil {
 			return ack, nil
 		}
@@ -141,6 +142,9 @@ func renewLease(iface string, lease *Lease) (*Lease, error) {
 	pkt, err := parseV4Packet(buf[:n])
 	if err != nil {
 		return nil, err
+	}
+	if pkt.Op != bootReply || pkt.XID != xid || !bytes.Equal(pkt.CHAddr, mac) {
+		return nil, fmt.Errorf("DHCP renewal reply identity mismatch")
 	}
 
 	if pkt.messageType() == msgNak {
@@ -233,22 +237,27 @@ func sendBroadcast(fd int, data []byte, ifIndex int) error {
 	return syscall.Sendto(fd, data, 0, addr)
 }
 
-func recvResponse(fd int, xid uint32, expectedType byte, timeout time.Duration) (*v4Packet, error) {
-	tv := syscall.Timeval{
-		Sec:  int64(timeout.Seconds()),
-		Usec: int64((timeout % time.Second).Microseconds()),
-	}
-	// #nosec G103 -- unsafe.Sizeof on fixed-size struct is safe
-	_ = setsockopt(fd, syscall.SOL_SOCKET, syscall.SO_RCVTIMEO, unsafe.Pointer(&tv), uint32(unsafe.Sizeof(tv)))
-
+func recvResponse(ctx context.Context, fd int, xid uint32, mac net.HardwareAddr, expectedType byte, timeout time.Duration) (*v4Packet, error) {
 	buf := make([]byte, 1500)
 	deadline := time.Now().Add(timeout)
 
 	for time.Now().Before(deadline) {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		pollTimeout := minDuration(500*time.Millisecond, time.Until(deadline))
+		if pollTimeout <= 0 {
+			return nil, fmt.Errorf("timeout")
+		}
+		tv := syscall.NsecToTimeval(pollTimeout.Nanoseconds())
+		// #nosec G103 -- unsafe.Sizeof on fixed-size struct is safe
+		if err := setsockopt(fd, syscall.SOL_SOCKET, syscall.SO_RCVTIMEO, unsafe.Pointer(&tv), uint32(unsafe.Sizeof(tv))); err != nil {
+			return nil, fmt.Errorf("set receive timeout: %w", err)
+		}
 		n, _, err := syscall.Recvfrom(fd, buf, 0)
 		if err != nil {
 			if err == syscall.EAGAIN || err == syscall.EWOULDBLOCK {
-				return nil, fmt.Errorf("timeout")
+				continue
 			}
 			return nil, err
 		}
@@ -264,7 +273,7 @@ func recvResponse(fd int, xid uint32, expectedType byte, timeout time.Duration) 
 			continue
 		}
 
-		if pkt.XID != xid {
+		if pkt.Op != bootReply || pkt.XID != xid || !bytes.Equal(pkt.CHAddr, mac) {
 			continue
 		}
 
@@ -278,6 +287,13 @@ func recvResponse(fd int, xid uint32, expectedType byte, timeout time.Duration) 
 	}
 
 	return nil, fmt.Errorf("timeout")
+}
+
+func minDuration(a, b time.Duration) time.Duration {
+	if a < b {
+		return a
+	}
+	return b
 }
 
 func setsockopt(fd, level, name int, val unsafe.Pointer, vallen uint32) error {

@@ -1,8 +1,13 @@
-.PHONY: build install clean install-systemd install-openrc install-sysv install-runit
+.PHONY: fmt lint test build install clean install-systemd install-openrc install-sysv install-runit
 
-VERSION := 0.1.2
+VERSION := 0.1.3
 LDFLAGS := -ldflags "-s -w -X main.version=$(VERSION)"
-PREFIX  := /usr/local
+PREFIX      ?= /usr/local
+SYSCONFDIR  ?= /etc
+INITDIR     ?= /etc/init.d
+SYSTEMDDIR  ?= /etc/systemd/system
+RUNITDIR    ?= /etc/sv
+RUNITACTIVE ?= /var/service
 
 fmt:
 	go fmt ./...
@@ -19,25 +24,28 @@ build:
 
 install: build
 	install -Dm755 nic $(DESTDIR)$(PREFIX)/sbin/nic
-	@test -f /etc/nic.conf || install -Dm644 examples/nic.conf /etc/nic.conf
-	@mkdir -p /etc/nic.d
+	@test -f $(DESTDIR)$(SYSCONFDIR)/nic.conf || install -Dm600 examples/nic.conf $(DESTDIR)$(SYSCONFDIR)/nic.conf
+	@mkdir -p $(DESTDIR)$(SYSCONFDIR)/nic.d
 
 install-systemd: install
-	bash init/systemd/install.sh
+	DESTDIR="$(DESTDIR)" PREFIX="$(PREFIX)" SYSTEMDDIR="$(SYSTEMDDIR)" bash init/systemd/install.sh
 
 install-openrc: install
-	install -Dm755 init/openrc/nic /etc/init.d/nic
-	rc-update add nic boot
+	install -Dm755 init/openrc/nic $(DESTDIR)$(INITDIR)/nic
+	sed -i 's|@PREFIX@|$(PREFIX)|g' $(DESTDIR)$(INITDIR)/nic
+	@if test -z "$(DESTDIR)"; then rc-update add nic boot; fi
 
 install-sysv: install
-	install -Dm755 init/sysv/nic /etc/init.d/nic
-	@if command -v update-rc.d >/dev/null 2>&1; then update-rc.d nic defaults; \
-	elif command -v chkconfig >/dev/null 2>&1; then chkconfig --add nic; fi
+	install -Dm755 init/sysv/nic $(DESTDIR)$(INITDIR)/nic
+	sed -i 's|@PREFIX@|$(PREFIX)|g' $(DESTDIR)$(INITDIR)/nic
+	@if test -z "$(DESTDIR)" && command -v update-rc.d >/dev/null 2>&1; then update-rc.d nic defaults; \
+	elif test -z "$(DESTDIR)" && command -v chkconfig >/dev/null 2>&1; then chkconfig --add nic; fi
 
 install-runit: install
-	mkdir -p /etc/sv/nic
-	install -Dm755 init/runit/run /etc/sv/nic/run
-	ln -sf /etc/sv/nic /var/service/nic
+	mkdir -p $(DESTDIR)$(RUNITDIR)/nic $(DESTDIR)$(RUNITACTIVE)
+	install -Dm755 init/runit/run $(DESTDIR)$(RUNITDIR)/nic/run
+	sed -i 's|@PREFIX@|$(PREFIX)|g' $(DESTDIR)$(RUNITDIR)/nic/run
+	ln -sfn $(RUNITDIR)/nic $(DESTDIR)$(RUNITACTIVE)/nic
 
 clean:
 	rm -f nic

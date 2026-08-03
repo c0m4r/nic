@@ -16,6 +16,8 @@ func TestTokenize(t *testing.T) {
 		{"  ip  a  a  10.0.0.1/24  dev  lo  ", []string{"ip", "a", "a", "10.0.0.1/24", "dev", "lo"}},
 		{`wifi "My Network" secret`, []string{"wifi", "My Network", "secret"}},
 		{`wifi 'My Network' secret`, []string{"wifi", "My Network", "secret"}},
+		{`wifi "Cafe #1" 'pa\'ss'`, []string{"wifi", "Cafe #1", "pa'ss"}},
+		{`wifi "" secret`, []string{"wifi", "", "secret"}},
 		{"ns 1.1.1.1", []string{"ns", "1.1.1.1"}},
 		{"", nil},
 		{"   ", nil},
@@ -26,6 +28,58 @@ func TestTokenize(t *testing.T) {
 		if !reflect.DeepEqual(got, tt.want) {
 			t.Errorf("tokenize(%q) = %v, want %v", tt.input, got, tt.want)
 		}
+	}
+}
+
+func TestQuotedHashAndMalformedQuotes(t *testing.T) {
+	cmd, err := parseLine(`wifi "Cafe #1" "secret # phrase" # comment`, "wifi.conf", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"wifi", "Cafe #1", "secret # phrase"}
+	if !reflect.DeepEqual(cmd.Tokens, want) {
+		t.Fatalf("tokens = %#v, want %#v", cmd.Tokens, want)
+	}
+	if _, err := parseLine(`wifi "unterminated secret`, "wifi.conf", 2); err == nil {
+		t.Fatal("expected unterminated quote error")
+	}
+}
+
+func TestValidationRejectsInvalidValues(t *testing.T) {
+	for _, line := range []string{
+		"ns not-an-ip",
+		"dhcp eth0 mystery-client",
+		"if eth0 sideways",
+		"ip 192.0.2.1/99 eth0",
+		"ip",
+		"route nonsense eth0",
+		"route default via not-an-ip eth0",
+		"route default via 192.0.2.1 eth0 extra",
+		"dhcp ../../tmp/escape",
+		"dhcpv6 ../escape",
+		"wifi ssid password ../../tmp/escape",
+		"ip 192.0.2.1/24 ../escape",
+		"route default ../escape",
+		"alias safe interface-name-that-is-too-long",
+	} {
+		if _, err := parseLine(line, "bad.conf", 1); err == nil {
+			t.Errorf("parseLine(%q) succeeded", line)
+		}
+	}
+}
+
+func TestIncludeCycle(t *testing.T) {
+	dir := t.TempDir()
+	a := filepath.Join(dir, "a.conf")
+	b := filepath.Join(dir, "b.conf")
+	if err := os.WriteFile(a, []byte("include b.conf\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(b, []byte("include a.conf\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Load(a); err == nil {
+		t.Fatal("expected include cycle error")
 	}
 }
 

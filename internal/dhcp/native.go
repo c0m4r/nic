@@ -47,10 +47,7 @@ func startNative(iface string, daemonMode bool) error {
 	v4lease, v4err := runDHCPv4(acquireCtx, iface)
 
 	if v4err != nil || v4lease == nil {
-		cancel()
-		nativeClientsMu.Lock()
-		delete(nativeClients, iface)
-		nativeClientsMu.Unlock()
+		finishFailedStart(iface, nc)
 		if v4err != nil {
 			return fmt.Errorf("dhcp v4: %w", v4err)
 		}
@@ -59,10 +56,7 @@ func startNative(iface string, daemonMode bool) error {
 
 	if err := applyLease(iface, v4lease); err != nil {
 		fmt.Printf("%s: apply failed: %v\n", iface, err)
-		cancel()
-		nativeClientsMu.Lock()
-		delete(nativeClients, iface)
-		nativeClientsMu.Unlock()
+		finishFailedStart(iface, nc)
 		return fmt.Errorf("%s: %w", iface, err)
 	}
 
@@ -74,9 +68,7 @@ func startNative(iface string, daemonMode bool) error {
 	if daemonMode {
 		go nc.renewLoop(ctx)
 	} else {
-		// Oneshot mode: cancel context immediately after acquiring lease
-		// This stops the renewal loop but keeps the lease applied
-		cancel()
+		finishOneShot(iface, nc)
 	}
 	return nil
 }
@@ -102,10 +94,7 @@ func startNativeV6(iface string, daemonMode bool) error {
 	v6lease, v6err := runDHCPv6(acquireCtx, iface)
 
 	if v6err != nil || v6lease == nil {
-		cancel()
-		nativeClientsMu.Lock()
-		delete(nativeClients, key)
-		nativeClientsMu.Unlock()
+		finishFailedStart(key, nc)
 		if v6err != nil {
 			return fmt.Errorf("dhcp v6: %w", v6err)
 		}
@@ -114,10 +103,7 @@ func startNativeV6(iface string, daemonMode bool) error {
 
 	if err := applyLeaseV6(iface, v6lease); err != nil {
 		fmt.Printf("%s: v6 apply failed: %v\n", iface, err)
-		cancel()
-		nativeClientsMu.Lock()
-		delete(nativeClients, key)
-		nativeClientsMu.Unlock()
+		finishFailedStart(key, nc)
 		return fmt.Errorf("%s: %w", iface, err)
 	}
 
@@ -133,10 +119,25 @@ func startNativeV6(iface string, daemonMode bool) error {
 	if daemonMode {
 		go nc.renewLoop(ctx)
 	} else {
-		// Oneshot mode: cancel context immediately after acquiring lease
-		cancel()
+		finishOneShot(key, nc)
 	}
 	return nil
+}
+
+func finishOneShot(key string, nc *nativeClient) {
+	nc.cancel()
+	nativeClientsMu.Lock()
+	delete(nativeClients, key)
+	nativeClientsMu.Unlock()
+	close(nc.done)
+}
+
+func finishFailedStart(key string, nc *nativeClient) {
+	nc.cancel()
+	nativeClientsMu.Lock()
+	delete(nativeClients, key)
+	nativeClientsMu.Unlock()
+	close(nc.done)
 }
 
 func (nc *nativeClient) renewLoop(ctx context.Context) {
@@ -159,9 +160,11 @@ func (nc *nativeClient) renewLoop(ctx context.Context) {
 		}
 
 		if leaseV6 != nil && len(leaseV6.Addresses) > 0 {
-			// Use preferred lifetime / 2 for renewal
-			addr := leaseV6.Addresses[0]
-			t := leaseV6.AcquiredAt.Add(time.Duration(addr.PreferredLife/2) * time.Second)
+			renewAfter := leaseV6.RenewTime
+			if renewAfter == 0 {
+				renewAfter = leaseV6.Addresses[0].PreferredLife / 2
+			}
+			t := leaseV6.AcquiredAt.Add(time.Duration(renewAfter) * time.Second)
 			if nextRenew.IsZero() || t.Before(nextRenew) {
 				nextRenew = t
 			}
@@ -200,8 +203,8 @@ func (nc *nativeClient) renewLoop(ctx context.Context) {
 					continue
 				}
 			}
-			unapplyLease(nc.iface, lease)
-			if err := applyLease(nc.iface, newLease); err == nil {
+			if err := applyLeaseReplacing(nc.iface, newLease, lease); err == nil {
+				cleanupSupersededLease(nc.iface, lease, newLease)
 				nc.mu.Lock()
 				nc.lease = newLease
 				nc.mu.Unlock()
@@ -213,14 +216,18 @@ func (nc *nativeClient) renewLoop(ctx context.Context) {
 		if leaseV6 != nil {
 			mac, _, err := getIfaceInfo(nc.iface)
 			if err == nil {
-				duid := newDUID(mac)
+				duid, duidErr := leaseDUID(leaseV6, mac)
+				if duidErr != nil {
+					fmt.Printf("dhcp: v6 client identity failed: %v\n", duidErr)
+					continue
+				}
 				newLease, err := renewLeaseV6(nc.iface, leaseV6, duid)
 				if err != nil {
 					fmt.Printf("dhcp: v6 renew failed: %v\n", err)
 					continue
 				}
-				unapplyLeaseV6(nc.iface, leaseV6)
-				if err := applyLeaseV6(nc.iface, newLease); err == nil {
+				if err := applyLeaseV6Replacing(nc.iface, newLease, leaseV6); err == nil {
+					cleanupSupersededLeaseV6(nc.iface, leaseV6, newLease)
 					nc.mu.Lock()
 					nc.leaseV6 = newLease
 					nc.mu.Unlock()
@@ -260,22 +267,26 @@ func (nc *nativeClient) release() {
 	if leaseV6 != nil {
 		mac, _, err := getIfaceInfo(nc.iface)
 		if err == nil {
-			duid := newDUID(mac)
-			var addrs []iaAddrInfo
-			for _, a := range leaseV6.Addresses {
-				addrs = append(addrs, iaAddrInfo{IP: net.ParseIP(a.IP)})
-			}
-			var txID [3]byte
-			release := buildReleaseV6(duid, leaseV6.ServerDUID, leaseV6.IAID, txID, addrs)
-			conn, err := net.ListenPacket("udp6", "[::]:546")
-			if err == nil {
-				dst := &net.UDPAddr{
-					IP:   dhcpv6ServerAddr.IP,
-					Port: dhcpv6ServerAddr.Port,
-					Zone: nc.iface,
+			duid, duidErr := leaseDUID(leaseV6, mac)
+			if duidErr != nil {
+				fmt.Printf("dhcp: v6 release identity failed: %v\n", duidErr)
+			} else {
+				var addrs []iaAddrInfo
+				for _, a := range leaseV6.Addresses {
+					addrs = append(addrs, iaAddrInfo{IP: net.ParseIP(a.IP)})
 				}
-				_, _ = conn.WriteTo(release, dst)
-				_ = conn.Close()
+				txID := randomTxID()
+				release := buildReleaseV6(duid, leaseV6.ServerDUID, leaseV6.IAID, txID, addrs)
+				conn, err := net.ListenPacket("udp6", "[::]:546")
+				if err == nil {
+					dst := &net.UDPAddr{
+						IP:   dhcpv6ServerAddr.IP,
+						Port: dhcpv6ServerAddr.Port,
+						Zone: nc.iface,
+					}
+					_, _ = conn.WriteTo(release, dst)
+					_ = conn.Close()
+				}
 			}
 		}
 		unapplyLeaseV6(nc.iface, leaseV6)

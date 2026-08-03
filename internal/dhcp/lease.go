@@ -30,7 +30,10 @@ type LeaseV6 struct {
 	Addresses  []V6Addr  `json:"addresses"`
 	DNS        []string  `json:"dns"`
 	ServerDUID []byte    `json:"server_duid"`
+	ClientDUID []byte    `json:"client_duid"`
 	IAID       uint32    `json:"iaid"`
+	RenewTime  uint32    `json:"renew_time"`
+	RebindTime uint32    `json:"rebind_time"`
 	AcquiredAt time.Time `json:"acquired_at"`
 }
 
