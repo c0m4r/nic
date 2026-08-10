@@ -51,18 +51,106 @@ func (m *Manager) Resolve() error {
 	return nil
 }
 
-// ResolveInTokens replaces any token matching a known alias/pin name with
-// the actual interface name.
+// ResolveInTokens replaces aliases only where iproute2 expects an interface
+// name. Replacing every matching token corrupts literals such as a route's
+// "default" destination or a link-state "up" when those happen to be aliases.
 func (m *Manager) ResolveInTokens(tokens []string) []string {
 	out := make([]string, len(tokens))
-	for i, tok := range tokens {
-		if resolved, ok := m.resolved[tok]; ok {
-			out[i] = resolved
-		} else {
-			out[i] = tok
-		}
+	copy(out, tokens)
+
+	objectIndex, ok := ipObjectIndex(out)
+	if !ok {
+		return out
+	}
+
+	switch canonicalIPObject(out[objectIndex]) {
+	case "link":
+		m.resolveLinkInterfaces(out, objectIndex)
+	case "address", "route":
+		resolveAfterKeywords(out, m.resolveToken, "dev")
+	case "rule":
+		resolveAfterKeywords(out, m.resolveToken, "iif", "oif")
 	}
 	return out
+}
+
+func (m *Manager) resolveLinkInterfaces(tokens []string, objectIndex int) {
+	action := canonicalIPAction(tokens[objectIndex+1])
+	switch action {
+	case "set", "delete":
+		position := objectIndex + 2
+		if position < len(tokens) && tokens[position] == "dev" {
+			position++
+		}
+		if position < len(tokens) {
+			m.resolveToken(tokens, position)
+		}
+		// The only additional interface value supported by nic's rollback-safe
+		// link settings is "master <interface>".
+		resolveAfterKeywords(tokens, m.resolveToken, "master")
+	case "add":
+		// link add link <parent> name <new-name> ...: parent is an
+		// interface reference, while the new interface name is a literal.
+		for i := objectIndex + 2; i+1 < len(tokens); i++ {
+			if tokens[i] == "link" {
+				m.resolveToken(tokens, i+1)
+			}
+		}
+	}
+}
+
+func (m *Manager) resolveToken(tokens []string, index int) {
+	if resolved, ok := m.resolved[tokens[index]]; ok {
+		tokens[index] = resolved
+	}
+}
+
+func resolveAfterKeywords(tokens []string, resolve func([]string, int), keywords ...string) {
+	for i := 0; i+1 < len(tokens); i++ {
+		for _, keyword := range keywords {
+			if tokens[i] == keyword {
+				resolve(tokens, i+1)
+				break
+			}
+		}
+	}
+}
+
+func ipObjectIndex(tokens []string) (int, bool) {
+	index := 0
+	for index < len(tokens) && (tokens[index] == "-4" || tokens[index] == "-6") {
+		index++
+	}
+	return index, index+1 < len(tokens)
+}
+
+func canonicalIPObject(word string) string {
+	if word == "r" || strings.HasPrefix("route", word) {
+		return "route"
+	}
+	if strings.HasPrefix("rule", word) {
+		return "rule"
+	}
+	if strings.HasPrefix("link", word) {
+		return "link"
+	}
+	if strings.HasPrefix("address", word) || strings.HasPrefix("addr", word) {
+		return "address"
+	}
+	return word
+}
+
+func canonicalIPAction(word string) string {
+	switch {
+	case strings.HasPrefix("set", word):
+		return "set"
+	case strings.HasPrefix("add", word):
+		return "add"
+	case strings.HasPrefix("delete", word), strings.HasPrefix("del", word):
+		return "delete"
+	default:
+		return word
+	}
 }
 
 // Get returns the resolved interface name for an alias/pin, if known.

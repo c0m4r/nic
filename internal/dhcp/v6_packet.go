@@ -283,9 +283,33 @@ func buildRenewV6(clientDUID v6DUID, serverDUID []byte, iaid uint32, txID [3]byt
 	m.Options = append(m.Options, v6Option{Code: optV6ClientID, Data: clientDUID.raw})
 	m.Options = append(m.Options, v6Option{Code: optV6ServerID, Data: serverDUID})
 	m.Options = append(m.Options, v6Option{Code: optV6IANA, Data: buildIANA(iaid, addrs)})
+	m.Options = append(m.Options, v6DNSOptionRequest())
 	m.Options = append(m.Options, v6Option{Code: optV6ElapsedTime, Data: []byte{0, 0}})
 
 	return m.marshal()
+}
+
+// buildRebindV6 creates a DHCPv6 REBIND. REBIND deliberately omits Server ID
+// so that any server can extend the client's IA_NA after T2.
+func buildRebindV6(clientDUID v6DUID, iaid uint32, txID [3]byte, addrs []iaAddrInfo) []byte {
+	m := &v6Message{
+		Type:          msgV6Rebind,
+		TransactionID: txID,
+	}
+
+	m.Options = append(m.Options, v6Option{Code: optV6ClientID, Data: clientDUID.raw})
+	m.Options = append(m.Options, v6Option{Code: optV6IANA, Data: buildIANA(iaid, addrs)})
+	m.Options = append(m.Options, v6DNSOptionRequest())
+	m.Options = append(m.Options, v6Option{Code: optV6ElapsedTime, Data: []byte{0, 0}})
+
+	return m.marshal()
+}
+
+func v6DNSOptionRequest() v6Option {
+	oro := make([]byte, 4)
+	binary.BigEndian.PutUint16(oro[0:2], optV6DNSServers)
+	binary.BigEndian.PutUint16(oro[2:4], optV6DomainList)
+	return v6Option{Code: optV6ORO, Data: oro}
 }
 
 // buildReleaseV6 creates a DHCPv6 RELEASE message.

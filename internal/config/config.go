@@ -114,13 +114,13 @@ func (cfg *Config) loadFile(path string) error {
 	cfg.loading[canonical] = true
 	defer delete(cfg.loading, canonical)
 
-	f, err := os.Open(path)
+	f, err := os.Open(canonical)
 	if err != nil {
-		return fmt.Errorf("open %s: %w", path, err)
+		return fmt.Errorf("open %s: %w", canonical, err)
 	}
 	defer func() { _ = f.Close() }()
 
-	dir := filepath.Dir(path)
+	dir := filepath.Dir(canonical)
 	scanner := bufio.NewScanner(f)
 	lineNum := 0
 	for scanner.Scan() {
@@ -132,9 +132,9 @@ func (cfg *Config) loadFile(path string) error {
 			continue
 		}
 
-		cmd, err := parseLine(line, path, lineNum)
+		cmd, err := parseLine(line, canonical, lineNum)
 		if err != nil {
-			return fmt.Errorf("%s:%d: %w", path, lineNum, err)
+			return fmt.Errorf("%s:%d: %w", canonical, lineNum, err)
 		}
 
 		// Handle include directives immediately
@@ -144,7 +144,7 @@ func (cfg *Config) loadFile(path string) error {
 				pattern = filepath.Join(dir, pattern)
 			}
 			if err := cfg.handleInclude(pattern); err != nil {
-				return fmt.Errorf("%s:%d: include: %w", path, lineNum, err)
+				return fmt.Errorf("%s:%d: include: %w", canonical, lineNum, err)
 			}
 			continue
 		}

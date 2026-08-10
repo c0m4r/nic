@@ -7,9 +7,8 @@ import (
 	"github.com/c0m4r/nic/internal/executor"
 )
 
-const pidDir = "/run/nic/dhcp"
-
 var (
+	pidDir           = "/run/nic/dhcp"
 	nativeStarter    = startNative
 	externalStarter  = startExternal
 	externalDetector = detectExternalClient

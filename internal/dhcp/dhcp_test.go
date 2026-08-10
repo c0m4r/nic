@@ -6,10 +6,14 @@ import (
 	"errors"
 	"net"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/c0m4r/nic/internal/control"
 	"github.com/c0m4r/nic/internal/executor"
 )
 
@@ -110,6 +114,31 @@ exit 0
 	}
 	if err := applyLease("eth0", lease); err == nil || !strings.Contains(err.Error(), "route-denied") {
 		t.Fatalf("applyLease error = %v", err)
+	}
+}
+
+func TestEnsureInterfaceUp(t *testing.T) {
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "ip.log")
+	script := "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$NIC_TEST_IP_LOG\"\n"
+	if err := os.WriteFile(filepath.Join(dir, "ip"), []byte(script), 0755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir)
+	t.Setenv("NIC_TEST_IP_LOG", logPath)
+	oldDryRun := executor.DryRun
+	executor.DryRun = false
+	t.Cleanup(func() { executor.DryRun = oldDryRun })
+
+	if err := ensureInterfaceUp("eth0"); err != nil {
+		t.Fatal(err)
+	}
+	log, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.TrimSpace(string(log)) != "link set eth0 up" {
+		t.Fatalf("ip command = %q, want link set eth0 up", log)
 	}
 }
 
@@ -278,6 +307,75 @@ func TestWrapUDPIP(t *testing.T) {
 	}
 }
 
+func TestV4RebindPacketUsesExistingLeaseAddress(t *testing.T) {
+	mac, _ := net.ParseMAC("aa:bb:cc:dd:ee:ff")
+	clientIP := net.ParseIP("192.0.2.25")
+	request := buildRebind(mac, 0x01020304, clientIP)
+	pkt, err := parseV4Packet(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pkt.messageType() != msgRequest {
+		t.Fatalf("message type = %d, want DHCPREQUEST", pkt.messageType())
+	}
+	if pkt.Flags != 0x8000 {
+		t.Fatalf("flags = %#x, want broadcast", pkt.Flags)
+	}
+	if !pkt.CIAddr.Equal(clientIP) {
+		t.Fatalf("ciaddr = %s, want %s", pkt.CIAddr, clientIP)
+	}
+	if pkt.getOption(optServerID) != nil {
+		t.Fatal("rebind included a server identifier")
+	}
+
+	wired := wrapUDPIPFromTo(request, clientIP, net.IPv4bcast)
+	if !net.IP(wired[12:16]).Equal(clientIP) {
+		t.Fatalf("source address = %s, want %s", net.IP(wired[12:16]), clientIP)
+	}
+	if !net.IP(wired[16:20]).Equal(net.IPv4bcast) {
+		t.Fatalf("destination address = %s, want broadcast", net.IP(wired[16:20]))
+	}
+}
+
+func TestV4LeaseUDPAddrsUseDHCPClientAndServerPorts(t *testing.T) {
+	local, server, err := v4LeaseUDPAddrs(&Lease{IP: "192.0.2.25", ServerIP: "192.0.2.1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if local.Port != 68 || !local.IP.Equal(net.ParseIP("192.0.2.25")) {
+		t.Fatalf("local endpoint = %s, want 192.0.2.25:68", local)
+	}
+	if server.Port != 67 || !server.IP.Equal(net.ParseIP("192.0.2.1")) {
+		t.Fatalf("server endpoint = %s, want 192.0.2.1:67", server)
+	}
+}
+
+func TestParseRenewedLeasePreservesOmittedFields(t *testing.T) {
+	mac, _ := net.ParseMAC("aa:bb:cc:dd:ee:ff")
+	ack := newV4Base(mac, 1)
+	ack.Op = bootReply
+	ack.Options = []v4Option{{Code: optMessageType, Data: []byte{msgAck}}}
+	previous := &Lease{
+		Interface: "eth0", IP: "192.0.2.25", SubnetMask: "255.255.255.128",
+		Router: "192.0.2.1", DNS: []string{"192.0.2.53"}, Domain: "example.test",
+		ServerIP: "192.0.2.2", LeaseTime: 600, RenewTime: 300, RebindTime: 525,
+	}
+
+	renewed, err := parseRenewedLease("eth0", ack, previous)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if renewed.IP != previous.IP || renewed.SubnetMask != previous.SubnetMask ||
+		renewed.Router != previous.Router || renewed.ServerIP != previous.ServerIP ||
+		renewed.LeaseTime != previous.LeaseTime || renewed.RenewTime != previous.RenewTime ||
+		renewed.RebindTime != previous.RebindTime {
+		t.Fatalf("omitted renewal values were not preserved: %+v", renewed)
+	}
+	if len(renewed.DNS) != 1 || renewed.DNS[0] != previous.DNS[0] || renewed.Domain != previous.Domain {
+		t.Fatalf("renewed DNS/domain = %+v, %q", renewed.DNS, renewed.Domain)
+	}
+}
+
 func TestExtractDHCPPayload(t *testing.T) {
 	// Simulate an incoming server→client packet (dst port 68)
 	dhcpPayload := buildDiscover(net.HardwareAddr{0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff}, 1)
@@ -412,6 +510,27 @@ func TestV6RequestRoundTrip(t *testing.T) {
 	}
 }
 
+func TestV6RebindOmitsServerIDAndRequestsDNS(t *testing.T) {
+	duid := newDUID(net.HardwareAddr{0, 1, 2, 3, 4, 5})
+	txID := [3]byte{1, 2, 3}
+	packet := buildRebindV6(duid, 42, txID, []iaAddrInfo{{
+		IP: net.ParseIP("2001:db8::25"), PreferredLife: 60, ValidLife: 120,
+	}})
+	msg, err := parseV6Message(packet)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if msg.Type != msgV6Rebind || msg.TransactionID != txID {
+		t.Fatalf("rebind header = type %d txid %v", msg.Type, msg.TransactionID)
+	}
+	if msg.getOption(optV6ServerID) != nil {
+		t.Fatal("rebind included a server identifier")
+	}
+	if msg.getOption(optV6ClientID) == nil || msg.getOption(optV6IANA) == nil || msg.getOption(optV6ORO) == nil {
+		t.Fatal("rebind did not include client ID, IA_NA, and ORO")
+	}
+}
+
 func TestParseDNSServers(t *testing.T) {
 	// Two DNS servers
 	data := make([]byte, 32)
@@ -427,6 +546,112 @@ func TestParseDNSServers(t *testing.T) {
 	}
 	if servers[1] != "2001:4860:4860::8844" {
 		t.Errorf("server[1] = %s, want 2001:4860:4860::8844", servers[1])
+	}
+}
+
+func TestParseLeaseV6SkipsWithdrawnAddresses(t *testing.T) {
+	client := newDUID(net.HardwareAddr{0, 1, 2, 3, 4, 5})
+	server := []byte{0, 3, 0, 1, 2, 3}
+	iaid := uint32(42)
+	msg := &v6Message{
+		Type:          msgV6Reply,
+		TransactionID: [3]byte{1, 2, 3},
+		Options: []v6Option{
+			{Code: optV6ClientID, Data: client.raw},
+			{Code: optV6ServerID, Data: server},
+			{Code: optV6IANA, Data: buildIANA(iaid, []iaAddrInfo{
+				{IP: net.ParseIP("2001:db8::10"), PreferredLife: 0, ValidLife: 0},
+				{IP: net.ParseIP("2001:db8::11"), PreferredLife: 60, ValidLife: 120},
+			})},
+		},
+	}
+	lease, err := parseLeaseV6("eth0", msg, server, iaid, client)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(lease.Addresses) != 1 || lease.Addresses[0].IP != "2001:db8::11" {
+		t.Fatalf("addresses = %+v, want only the non-expired address", lease.Addresses)
+	}
+}
+
+func TestParseLeaseV6RejectsInvalidLifetimes(t *testing.T) {
+	client := newDUID(net.HardwareAddr{0, 1, 2, 3, 4, 5})
+	server := []byte{0, 3, 0, 1, 2, 3}
+	msg := &v6Message{Options: []v6Option{{
+		Code: optV6IANA,
+		Data: buildIANA(7, []iaAddrInfo{{
+			IP: net.ParseIP("2001:db8::12"), PreferredLife: 121, ValidLife: 120,
+		}}),
+	}}}
+	if _, err := parseLeaseV6("eth0", msg, server, 7, client); err == nil {
+		t.Fatal("accepted a DHCPv6 address with invalid lifetimes")
+	}
+}
+
+func TestParseRenewedLeaseV6PreservesOmittedAddress(t *testing.T) {
+	client := newDUID(net.HardwareAddr{0, 1, 2, 3, 4, 5})
+	server := []byte{0, 3, 0, 1, 2, 3}
+	previous := &LeaseV6{
+		Interface: "eth0", IAID: 42, AcquiredAt: time.Now().Add(time.Second),
+		Addresses: []V6Addr{
+			{IP: "2001:db8::10", PrefixLen: 128, PreferredLife: 60, ValidLife: 120},
+			{IP: "2001:db8::11", PrefixLen: 128, PreferredLife: 90, ValidLife: 180},
+		},
+	}
+	msg := &v6Message{Options: []v6Option{{
+		Code: optV6IANA,
+		Data: buildIANA(42, []iaAddrInfo{{
+			IP: net.ParseIP("2001:db8::10"), PreferredLife: 120, ValidLife: 240,
+		}}),
+	}}}
+
+	lease, err := parseRenewedLeaseV6("eth0", msg, server, 42, client, previous)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(lease.Addresses) != 2 {
+		t.Fatalf("addresses = %+v, want updated and omitted addresses", lease.Addresses)
+	}
+	want := V6Addr{IP: "2001:db8::11", PrefixLen: 128, PreferredLife: 90, ValidLife: 180}
+	if lease.Addresses[1] != want {
+		t.Fatalf("omitted address = %+v, want %+v", lease.Addresses[1], want)
+	}
+}
+
+func TestParseRenewedLeaseV6HonorsExplicitWithdrawal(t *testing.T) {
+	client := newDUID(net.HardwareAddr{0, 1, 2, 3, 4, 5})
+	previous := &LeaseV6{
+		IAID: 42, AcquiredAt: time.Now().Add(time.Second),
+		Addresses: []V6Addr{
+			{IP: "2001:db8::10", PrefixLen: 128, PreferredLife: 60, ValidLife: 120},
+			{IP: "2001:db8::11", PrefixLen: 128, PreferredLife: 90, ValidLife: 180},
+		},
+	}
+	msg := &v6Message{Options: []v6Option{{
+		Code: optV6IANA,
+		Data: buildIANA(42, []iaAddrInfo{
+			{IP: net.ParseIP("2001:db8::10"), PreferredLife: 120, ValidLife: 240},
+			{IP: net.ParseIP("2001:db8::11"), PreferredLife: 0, ValidLife: 0},
+		}),
+	}}}
+
+	lease, err := parseRenewedLeaseV6("eth0", msg, []byte{1}, 42, client, previous)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(lease.Addresses) != 1 || lease.Addresses[0].IP != "2001:db8::10" {
+		t.Fatalf("addresses = %+v, withdrawn address was retained", lease.Addresses)
+	}
+
+	allWithdrawn := &v6Message{Options: []v6Option{{
+		Code: optV6IANA,
+		Data: buildIANA(42, []iaAddrInfo{
+			{IP: net.ParseIP("2001:db8::10"), PreferredLife: 0, ValidLife: 0},
+			{IP: net.ParseIP("2001:db8::11"), PreferredLife: 0, ValidLife: 0},
+		}),
+	}}}
+	if _, err := parseRenewedLeaseV6("eth0", allWithdrawn, []byte{1}, 42, client, previous); !errors.Is(err, errDHCPv6NoAddresses) {
+		t.Fatalf("all-withdrawn error = %v, want errDHCPv6NoAddresses", err)
 	}
 }
 
@@ -460,6 +685,66 @@ func TestLeaseCIDR(t *testing.T) {
 		l := &Lease{IP: tt.ip, SubnetMask: tt.mask}
 		if got := l.CIDR(); got != tt.want {
 			t.Errorf("CIDR(%s, %s) = %s, want %s", tt.ip, tt.mask, got, tt.want)
+		}
+	}
+}
+
+func TestLeaseV6DeadlinesUseEarliestLifetimes(t *testing.T) {
+	acquired := time.Unix(1_700_000_000, 0)
+	lease := &LeaseV6{
+		AcquiredAt: acquired,
+		Addresses: []V6Addr{
+			{IP: "2001:db8::1", PreferredLife: 80, ValidLife: 160},
+			{IP: "2001:db8::2", PreferredLife: 60, ValidLife: 120},
+		},
+	}
+	if got, want := lease.RenewalDeadline(), acquired.Add(30*time.Second); !got.Equal(want) {
+		t.Fatalf("renewal deadline = %s, want %s", got, want)
+	}
+	if got, want := lease.RebindDeadline(), acquired.Add(48*time.Second); !got.Equal(want) {
+		t.Fatalf("rebind deadline = %s, want %s", got, want)
+	}
+	if got, want := lease.ExpiryDeadline(), acquired.Add(120*time.Second); !got.Equal(want) {
+		t.Fatalf("expiry deadline = %s, want %s", got, want)
+	}
+}
+
+func TestStopExternalWaitsForTrackedClientBeforeRemovingRecords(t *testing.T) {
+	originalDir := pidDir
+	pidDir = t.TempDir()
+	t.Cleanup(func() { pidDir = originalDir })
+	originalClients := externalClients
+	externalClients = []string{"sleep"}
+	t.Cleanup(func() { externalClients = originalClients })
+
+	cmd := exec.Command("/bin/sleep", "30")
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = cmd.Process.Kill() })
+	go func() { _ = cmd.Wait() }()
+
+	record, err := control.RecordForPID(cmd.Process.Pid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(pidDir, "wan.ext.pid"), []byte(strconv.Itoa(record.PID)), 0600); err != nil {
+		t.Fatal(err)
+	}
+	managed := externalRecord{Client: "sleep", Process: &record}
+	if err := control.WriteJSONAtomic(externalRecordPath("wan"), managed, 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := stopExternal("wan"); err != nil {
+		t.Fatal(err)
+	}
+	if control.ProcessRecordIsLive(record) {
+		t.Fatal("external client was still live after stopExternal returned")
+	}
+	for _, path := range []string{filepath.Join(pidDir, "wan.ext.pid"), externalRecordPath("wan")} {
+		if _, err := os.Stat(path); !os.IsNotExist(err) {
+			t.Fatalf("tracking record remained at %s: %v", path, err)
 		}
 	}
 }

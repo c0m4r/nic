@@ -6,7 +6,10 @@ Before=network.target network-online.target
 After=local-fs.target systemd-udevd.service
 
 [Service]
-Type=simple
+Type=notify
+NotifyAccess=main
+TimeoutStartSec=5min
+TimeoutStopSec=90s
 ExecStart=@PREFIX@/sbin/nic start --daemon
 ExecStop=@PREFIX@/sbin/nic stop --force
 ExecReload=@PREFIX@/sbin/nic reload --force --no-rollback

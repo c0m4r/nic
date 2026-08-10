@@ -1,15 +1,21 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
+	"net"
 	"os"
 	"path/filepath"
 	"reflect"
 	"strings"
+	"syscall"
 	"testing"
+	"time"
 
 	"github.com/c0m4r/nic/internal/config"
 	"github.com/c0m4r/nic/internal/control"
+	"github.com/c0m4r/nic/internal/executor"
 	"github.com/c0m4r/nic/internal/state"
 )
 
@@ -33,6 +39,16 @@ func TestReverseIPCommand(t *testing.T) {
 			"link add → link del",
 			[]string{"link", "add", "bond0", "type", "bond"},
 			[]string{"link", "del", "bond0"},
+		},
+		{
+			"link add dev form deletes created link",
+			[]string{"link", "add", "dev", "bond0", "type", "bond"},
+			[]string{"link", "del", "bond0"},
+		},
+		{
+			"link add without a name is not reversible",
+			[]string{"link", "add", "type", "dummy"},
+			nil,
 		},
 		{
 			"address add → address del",
@@ -79,6 +95,11 @@ func TestReverseIPCommand(t *testing.T) {
 			[]string{"ru", "a", "priority", "100", "from", "192.0.2.0/24"},
 			[]string{"rule", "del", "priority", "100", "from", "192.0.2.0/24"},
 		},
+		{
+			"IPv6 address add preserves family option",
+			[]string{"-6", "address", "add", "2001:db8::1/64", "dev", "eth0"},
+			[]string{"-6", "address", "del", "2001:db8::1/64", "dev", "eth0"},
+		},
 	}
 
 	for _, tt := range tests {
@@ -86,6 +107,53 @@ func TestReverseIPCommand(t *testing.T) {
 		if !reflect.DeepEqual(got, tt.want) {
 			t.Errorf("%s: reverseIPCommand(%v) = %v, want %v", tt.name, tt.args, got, tt.want)
 		}
+	}
+}
+
+func TestValidateRollbackableIPCommand(t *testing.T) {
+	tests := []struct {
+		name string
+		args []string
+		bad  bool
+	}{
+		{"link add", []string{"link", "add", "bond0", "type", "bond"}, false},
+		{"link add dev form", []string{"link", "add", "dev", "bond0", "type", "bond"}, false},
+		{"vlan add", []string{"link", "add", "link", "bond0", "name", "bond0.10", "type", "vlan", "id", "10"}, false},
+		{"unnamed link add", []string{"link", "add", "type", "dummy"}, true},
+		{"restorable link settings", []string{"link", "set", "dev", "eth0", "mtu", "1400", "master", "bond0", "up"}, false},
+		{"IPv6 route", []string{"-6", "route", "add", "default", "via", "2001:db8::1", "dev", "eth0"}, false},
+		{"link delete", []string{"link", "delete", "eth0"}, true},
+		{"link rename", []string{"link", "set", "dev", "eth0", "name", "wan0"}, true},
+		{"link netns move", []string{"link", "set", "dev", "eth0", "netns", "1"}, true},
+		{"address delete", []string{"address", "delete", "192.0.2.1/24", "dev", "eth0"}, true},
+		{"unsupported object", []string{"neigh", "add", "192.0.2.1", "lladdr", "00:11:22:33:44:55", "dev", "eth0"}, true},
+	}
+	for _, tt := range tests {
+		err := validateRollbackableIPCommand(tt.args)
+		if tt.bad && err == nil {
+			t.Errorf("%s: expected rejection", tt.name)
+		}
+		if !tt.bad && err != nil {
+			t.Errorf("%s: unexpected rejection: %v", tt.name, err)
+		}
+	}
+}
+
+func TestApplyConfigRejectsUnsafeIPCommandBeforeExecution(t *testing.T) {
+	_, logPath := setupFakeRuntime(t)
+	cfg := &config.Config{Commands: []config.Command{{
+		Type: config.CmdIPRoute2,
+		Raw:  "ip link set dev eth0 name wan0",
+		Tokens: []string{
+			"ip", "link", "set", "dev", "eth0", "name", "wan0",
+		},
+		File: "nic.conf", LineNum: 1,
+	}}}
+	if err := applyConfig(cfg, false); err == nil || !strings.Contains(err.Error(), "cannot be safely restored") {
+		t.Fatalf("unsafe config error = %v", err)
+	}
+	if _, err := os.Stat(logPath); !os.IsNotExist(err) {
+		t.Fatalf("unsafe ip command ran, log error = %v", err)
 	}
 }
 
@@ -214,12 +282,174 @@ func TestReconcileCleansInterruptedConfiguration(t *testing.T) {
 	}
 }
 
+func TestNoManagedStateSnapshotsRequiresPendingStateToBeGone(t *testing.T) {
+	setupFakeRuntime(t)
+	if noManagedStateSnapshots() {
+		t.Fatal("baseline snapshot was ignored")
+	}
+	if err := os.Remove(control.BaseStatePath); err != nil {
+		t.Fatal(err)
+	}
+	if !noManagedStateSnapshots() {
+		t.Fatal("missing snapshots were not recognized")
+	}
+	if err := os.WriteFile(control.PendingConfigPath, []byte("{}"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if noManagedStateSnapshots() {
+		t.Fatal("pending configuration was ignored")
+	}
+}
+
+func TestNotifySystemdSendsReadinessDatagram(t *testing.T) {
+	socket := filepath.Join(t.TempDir(), "notify.sock")
+	listener, err := net.ListenUnixgram("unixgram", &net.UnixAddr{Name: socket, Net: "unixgram"})
+	if err != nil {
+		if errors.Is(err, syscall.EPERM) {
+			t.Skip("sandbox forbids Unix datagram socket binding")
+		}
+		t.Fatal(err)
+	}
+	defer func() { _ = listener.Close() }()
+	t.Setenv("NOTIFY_SOCKET", socket)
+
+	if err := notifySystemd("READY=1\nSTATUS=test"); err != nil {
+		t.Fatal(err)
+	}
+	if err := listener.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	buf := make([]byte, 128)
+	n, _, err := listener.ReadFromUnix(buf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := string(buf[:n]); got != "READY=1\nSTATUS=test" {
+		t.Fatalf("notification = %q", got)
+	}
+}
+
+func TestDiscardStaleReloadArtifactsKeepsOnlyCurrentRequest(t *testing.T) {
+	runtimeDir, _ := setupFakeRuntime(t)
+	current := control.PIDRecord{PID: 100, StartTime: "current"}
+	staleSnapshot := filepath.Join(runtimeDir, "reload-1-2.json")
+	if err := os.WriteFile(staleSnapshot, []byte("{}"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	stale := control.ReloadRequest{
+		ID: "1-2", SnapshotPath: staleSnapshot,
+		Daemon: control.PIDRecord{PID: 99, StartTime: "old"},
+	}
+	if err := control.WriteJSONAtomic(control.ReloadRequestPath, stale, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := control.WriteJSONAtomic(control.ReloadResponsePath, control.Response{ID: stale.ID}, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := discardStaleReloadArtifacts(current); err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range []string{control.ReloadRequestPath, control.ReloadResponsePath, staleSnapshot} {
+		if _, err := os.Stat(path); !os.IsNotExist(err) {
+			t.Fatalf("stale artifact %s remained: %v", path, err)
+		}
+	}
+
+	currentSnapshot := filepath.Join(runtimeDir, "reload-3-4.json")
+	if err := os.WriteFile(currentSnapshot, []byte("{}"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	request := control.ReloadRequest{ID: "3-4", SnapshotPath: currentSnapshot, Daemon: current}
+	if err := control.WriteJSONAtomic(control.ReloadRequestPath, request, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := discardStaleReloadArtifacts(current); err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range []string{control.ReloadRequestPath, currentSnapshot} {
+		if _, err := os.Stat(path); err != nil {
+			t.Fatalf("current reload artifact %s was removed: %v", path, err)
+		}
+	}
+}
+
+func TestRunDaemonRejectsReloadForPreviousInstance(t *testing.T) {
+	runtimeDir, _ := setupFakeRuntime(t)
+	snapshotPath := filepath.Join(runtimeDir, "reload-5-6.json")
+	if err := config.SaveSnapshot(snapshotPath, &config.Config{}); err != nil {
+		t.Fatal(err)
+	}
+	request := control.ReloadRequest{
+		ID: "5-6", SnapshotPath: snapshotPath,
+		Daemon: control.PIDRecord{PID: os.Getpid(), StartTime: "previous-instance"},
+	}
+	if err := control.WriteJSONAtomic(control.ReloadRequestPath, request, 0600); err != nil {
+		t.Fatal(err)
+	}
+	signals := make(chan os.Signal, 1)
+	signals <- syscall.SIGHUP
+	close(signals)
+	if err := runDaemon("unused.conf", signals); err != nil {
+		t.Fatal(err)
+	}
+	var response control.Response
+	if err := control.ReadJSON(control.ReloadResponsePath, &response); err != nil {
+		t.Fatal(err)
+	}
+	if response.ID != request.ID || !strings.Contains(response.Error, "different daemon instance") {
+		t.Fatalf("response = %+v", response)
+	}
+	if _, err := os.Stat(snapshotPath); !os.IsNotExist(err) {
+		t.Fatalf("stale snapshot remained: %v", err)
+	}
+}
+
+func TestDaemonStartupTerminationCancelsRunningCommand(t *testing.T) {
+	runtimeDir, _ := setupFakeRuntime(t)
+	marker := filepath.Join(runtimeDir, "command-started")
+	script := "#!/bin/sh\nif [ ! -e " + marker + " ]; then\n" +
+		"  /usr/bin/touch " + marker + "\n" +
+		"  /bin/sleep 30\n" +
+		"fi\nexit 0\n"
+	if err := os.WriteFile(filepath.Join(runtimeDir, "bin", "ip"), []byte(script), 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	startupCtx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	restore := executor.UseCommandContext(startupCtx)
+	signals := make(chan os.Signal, 1)
+	go func() {
+		deadline := time.Now().Add(time.Second)
+		for time.Now().Before(deadline) {
+			if _, err := os.Stat(marker); err == nil {
+				signals <- syscall.SIGTERM
+				return
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+		signals <- syscall.SIGTERM
+	}()
+
+	started := time.Now()
+	stopped, err := reconcileDaemonStartup(&config.Config{}, signals, cancel, restore)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !stopped {
+		t.Fatal("startup reconciliation did not report termination")
+	}
+	if elapsed := time.Since(started); elapsed > 2*time.Second {
+		t.Fatalf("startup termination took %v; running command was not cancelled", elapsed)
+	}
+}
+
 func setupFakeRuntime(t *testing.T) (string, string) {
 	t.Helper()
 	runtimeDir := t.TempDir()
 	oldPaths := []string{
 		control.RunDir, control.PIDPath, control.AppliedConfigPath, control.PendingConfigPath, control.BaseStatePath,
-		control.ReloadRequestPath, control.ReloadResponsePath, control.RevertResponsePath,
+		control.ReloadRequestPath, control.ReloadResponsePath, control.ReloadLockPath, control.RevertResponsePath,
 	}
 	control.RunDir = runtimeDir
 	control.PIDPath = filepath.Join(runtimeDir, "nic.pid")
@@ -228,6 +458,7 @@ func setupFakeRuntime(t *testing.T) (string, string) {
 	control.BaseStatePath = filepath.Join(runtimeDir, "base.json")
 	control.ReloadRequestPath = filepath.Join(runtimeDir, "request.json")
 	control.ReloadResponsePath = filepath.Join(runtimeDir, "response.json")
+	control.ReloadLockPath = filepath.Join(runtimeDir, "reload.lock")
 	control.RevertResponsePath = filepath.Join(runtimeDir, "revert-response.json")
 	t.Cleanup(func() {
 		control.RunDir = oldPaths[0]
@@ -237,7 +468,8 @@ func setupFakeRuntime(t *testing.T) (string, string) {
 		control.BaseStatePath = oldPaths[4]
 		control.ReloadRequestPath = oldPaths[5]
 		control.ReloadResponsePath = oldPaths[6]
-		control.RevertResponsePath = oldPaths[7]
+		control.ReloadLockPath = oldPaths[7]
+		control.RevertResponsePath = oldPaths[8]
 	})
 
 	snapshot := state.NetworkState{}

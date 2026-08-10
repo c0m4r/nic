@@ -2,10 +2,13 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"errors"
 	"fmt"
+	"net"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"syscall"
@@ -26,6 +29,8 @@ import (
 var version = "0.1.3"
 
 const defaultConfig = "/etc/nic.conf"
+
+const shutdownCommandTimeout = 35 * time.Second
 
 func main() {
 	args := os.Args[1:]
@@ -89,7 +94,9 @@ func main() {
 			fatal(err)
 		}
 	case "status":
-		cmdStatus()
+		if err := cmdStatus(); err != nil {
+			fatal(err)
+		}
 	case "show":
 		fmt.Printf("nic v%s | show\n", version)
 		if err := cmdShow(configPath); err != nil {
@@ -164,46 +171,146 @@ func cmdStart(configPath string, daemonMode bool) error {
 	}
 
 	var releasePID func()
+	var sigChan chan os.Signal
 	if daemonMode {
+		// Hold the reload lock before publishing the PID record. This closes the
+		// startup race where a new client could create a snapshot while stale
+		// reload artifacts are being discarded.
+		releaseStartupReload, claimErr := control.ClaimReload()
+		if claimErr != nil {
+			return claimErr
+		}
+		defer func() {
+			if releaseStartupReload != nil {
+				releaseStartupReload()
+			}
+		}()
+
+		// Register handlers before publishing the PID record. DHCP and WiFi
+		// setup can take time, and an immediate stop after startup must not use
+		// SIGTERM's default action and leave a partial pending configuration.
+		sigChan = make(chan os.Signal, 4)
+		signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP, syscall.SIGUSR1)
+		defer signal.Stop(sigChan)
+
 		releasePID, err = control.ClaimDaemon()
 		if err != nil {
 			return err
 		}
 		defer releasePID()
-	}
+		daemonRecord, recordErr := control.RecordForPID(os.Getpid())
+		if recordErr != nil {
+			return fmt.Errorf("identify daemon process: %w", recordErr)
+		}
+		if cleanupErr := discardStaleReloadArtifacts(daemonRecord); cleanupErr != nil {
+			fmt.Fprintf(os.Stderr, "warning: discard stale reload request: %v\n", cleanupErr)
+		}
+		releaseStartupReload()
+		releaseStartupReload = nil
 
-	if err := reconcileConfig(cfg, daemonMode); err != nil {
+		startupCtx, cancelStartup := context.WithCancel(context.Background())
+		defer cancelStartup()
+		restoreCommandContext := executor.UseCommandContext(startupCtx)
+		stopped, reconcileErr := reconcileDaemonStartup(
+			cfg, sigChan, cancelStartup, restoreCommandContext,
+		)
+		if reconcileErr != nil || stopped {
+			return reconcileErr
+		}
+	} else if err := reconcileConfig(cfg, false); err != nil {
 		return err
 	}
 
 	if daemonMode {
+		if err := notifySystemd("READY=1\nSTATUS=nic network configuration applied"); err != nil {
+			fmt.Fprintf(os.Stderr, "warning: systemd readiness notification failed: %v\n", err)
+		}
 		fmt.Println("Running in daemon mode. Press Ctrl+C to stop.")
-		return runDaemon(configPath)
+		return runDaemon(configPath, sigChan)
 	}
 
 	return nil
+}
+
+// reconcileDaemonStartup keeps termination responsive while reconciliation is
+// running. Cancelling the startup context stops both external commands and the
+// initial native DHCP exchange; restoring the executor context before waiting
+// lets reconcileConfig perform its normal rollback with a bounded shutdown
+// context.
+func reconcileDaemonStartup(
+	cfg *config.Config,
+	sigChan <-chan os.Signal,
+	cancel context.CancelFunc,
+	restoreCommandContext func(),
+) (bool, error) {
+	result := make(chan error, 1)
+	go func() {
+		result <- reconcileConfig(cfg, true)
+	}()
+
+	for {
+		select {
+		case err := <-result:
+			restoreCommandContext()
+			return false, err
+		case sig := <-sigChan:
+			switch sig {
+			case syscall.SIGINT, syscall.SIGTERM:
+				cancel()
+				restoreCommandContext()
+				shutdownCtx, cancelShutdown := context.WithTimeout(context.Background(), shutdownCommandTimeout)
+				restoreShutdownContext := executor.UseCommandContext(shutdownCtx)
+				// reconcileConfig rolls back a cancelled apply. Wait for that
+				// rollback, then remove any previous configuration it restored.
+				<-result
+				fmt.Println("\nShutting down gracefully...")
+				_ = notifySystemd("STOPPING=1\nSTATUS=nic is restoring the managed network state")
+				cleanupErr := stopManagedConfig("")
+				restoreShutdownContext()
+				cancelShutdown()
+				return true, cleanupErr
+			case syscall.SIGHUP:
+				rejectReloadDuringStartup()
+			case syscall.SIGUSR1:
+				response := control.Response{ID: "revert", Error: "daemon startup is still in progress"}
+				if err := control.WriteJSONAtomic(control.RevertResponsePath, response, 0600); err != nil {
+					fmt.Fprintf(os.Stderr, "revert response: %v\n", err)
+				}
+			}
+		}
+	}
 }
 
 func applyConfig(cfg *config.Config, daemonMode bool) error {
 	if err := validateWifiConfigPermissions(cfg); err != nil {
 		return err
 	}
+	if err := validateRollbackSafety(cfg); err != nil {
+		return err
+	}
 	mgr := alias.NewManager()
 	var nameservers []string
 
-	// First pass: collect aliases and pins
+	// First pass: collect aliases, pins, and static resolver inputs. Resolver
+	// policy must be in place before DHCP sessions start so later renewals cannot
+	// replace configured nameservers.
 	for _, cmd := range cfg.Commands {
 		switch cmd.Type {
 		case config.CmdAlias:
 			mgr.AddAlias(cmd.Tokens[1], cmd.Tokens[2])
 		case config.CmdPin:
 			mgr.AddPin(cmd.Tokens[1], cmd.Tokens[2])
+		case config.CmdNameserver:
+			nameservers = append(nameservers, cmd.Tokens[1])
 		}
 	}
 
 	// Resolve pins (look up actual interface names by MAC)
 	if err := mgr.Resolve(); err != nil {
 		return fmt.Errorf("resolve aliases: %w", err)
+	}
+	if err := dns.ConfigureStaticNameservers(nameservers); err != nil {
+		return fmt.Errorf("configure resolv.conf: %w", err)
 	}
 
 	// Setup loopback
@@ -217,7 +324,8 @@ func applyConfig(cfg *config.Config, daemonMode bool) error {
 			continue
 
 		case config.CmdNameserver:
-			nameservers = append(nameservers, cmd.Tokens[1])
+			// Applied before DHCP starts above.
+			continue
 
 		case config.CmdWifi:
 			iface := ""
@@ -271,16 +379,8 @@ func applyConfig(cfg *config.Config, daemonMode bool) error {
 			}
 		}
 	}
-
-	// Apply nameservers
-	if len(nameservers) > 0 {
-		if err := dns.WriteResolvConf(nameservers); err != nil {
-			return fmt.Errorf("write resolv.conf: %w", err)
-		}
-		if err := dns.Guard(); err != nil {
-			// Non-fatal, just warn
-			fmt.Fprintf(os.Stderr, "warning: could not guard resolv.conf: %v\n", err)
-		}
+	if err := dns.ApplyManagedNameservers(); err != nil {
+		return fmt.Errorf("write resolv.conf: %w", err)
 	}
 
 	// Wait for IPv6 DAD (duplicate address detection) to complete
@@ -491,6 +591,7 @@ func teardownConfig(cfg *config.Config) error {
 	if err := dns.Unguard(); err != nil {
 		teardownErrors = append(teardownErrors, err)
 	}
+	dns.ResetManagedNameservers()
 	return errors.Join(teardownErrors...)
 }
 
@@ -529,6 +630,14 @@ func stopManagedConfig(fallbackConfigPath string) error {
 	return nil
 }
 
+func stopManagedConfigBounded(fallbackConfigPath string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), shutdownCommandTimeout)
+	defer cancel()
+	restoreCommandContext := executor.UseCommandContext(ctx)
+	defer restoreCommandContext()
+	return stopManagedConfig(fallbackConfigPath)
+}
+
 func cmdStop(configPath string, cmdArgs []string) error {
 	force := false
 	for _, arg := range cmdArgs {
@@ -547,84 +656,214 @@ func cmdStop(configPath string, cmdArgs []string) error {
 		}
 	}
 
-	stopped, err := control.StopDaemon(15 * time.Second)
+	stopped, err := control.StopDaemon(45 * time.Second)
 	if err != nil {
 		return err
 	}
 	if stopped {
 		// The daemon tears down its in-memory DHCP clients and managed config.
-		if _, statErr := os.Stat(control.AppliedConfigPath); os.IsNotExist(statErr) {
+		if noManagedStateSnapshots() {
 			return nil
 		}
 	}
-	return stopManagedConfig(configPath)
+	return stopManagedConfigBounded(configPath)
+}
+
+func noManagedStateSnapshots() bool {
+	for _, path := range []string{
+		control.AppliedConfigPath,
+		control.PendingConfigPath,
+		control.BaseStatePath,
+	} {
+		if _, err := os.Stat(path); err == nil || !os.IsNotExist(err) {
+			return false
+		}
+	}
+	return true
 }
 
 // reverseIPCommand generates the reverse of an ip command for teardown.
 func reverseIPCommand(args []string) []string {
-	if len(args) < 2 {
+	objectIndex, ok := ipCommandObjectIndex(args)
+	if !ok {
 		return nil
 	}
 
-	obj := canonicalIPObject(args[0])
-	action := canonicalIPWord(args[1], map[string]string{
-		"add": "add", "set": "set", "replace": "replace",
+	obj := canonicalIPObject(args[objectIndex])
+	action := canonicalIPWord(args[objectIndex+1], map[string]string{
+		"add": "add", "set": "set", "change": "set", "replace": "replace",
 	})
 
 	switch {
 	case obj == "link" && action == "set":
+		propertyIndex, ok := linkSetPropertyIndex(args, objectIndex)
+		if !ok {
+			return nil
+		}
 		result := make([]string, len(args))
 		copy(result, args)
-		for i, a := range result {
+		for i := propertyIndex; i < len(result); i++ {
+			a := result[i]
 			if a == "up" {
 				result[i] = "down"
-				result[0], result[1] = "link", "set"
+				result[objectIndex], result[objectIndex+1] = "link", "set"
 				return result
 			}
 			if a == "down" {
-				result[0], result[1] = "link", "set"
+				result[objectIndex], result[objectIndex+1] = "link", "set"
 				return result
 			}
 			if a == "master" && i+1 < len(result) {
 				result = append(result[:i], result[i+2:]...)
 				result = append(result, "nomaster")
-				result[0], result[1] = "link", "set"
+				result[objectIndex], result[objectIndex+1] = "link", "set"
 				return result
 			}
 		}
 		return nil
 
 	case obj == "link" && action == "add":
-		name := ""
-		for i := 2; i+1 < len(args); i++ {
-			if args[i] == "name" {
-				name = args[i+1]
-				break
-			}
-		}
-		if name == "" && len(args) >= 3 && args[2] != "link" {
-			name = args[2]
-		}
+		name := linkAddName(args, objectIndex)
 		if name != "" {
-			return []string{"link", "del", name}
+			return append(append([]string{}, args[:objectIndex]...), "link", "del", name)
 		}
 
 	case obj == "address" && (action == "add" || action == "replace"):
 		result := make([]string, len(args))
 		copy(result, args)
-		result[0] = "address"
-		result[1] = "del"
+		result[objectIndex] = "address"
+		result[objectIndex+1] = "del"
 		return result
 
 	case (obj == "route" || obj == "rule") && (action == "add" || action == "replace"):
 		result := make([]string, len(args))
 		copy(result, args)
-		result[0] = obj
-		result[1] = "del"
+		result[objectIndex] = obj
+		result[objectIndex+1] = "del"
 		return result
 	}
 
 	return nil
+}
+
+// validateRollbackSafety restricts iproute2 passthrough to operations that
+// nic can reliably unwind. Applying a destructive command that is not in the
+// snapshot or has no inverse would defeat the tool's rollback guarantee.
+func validateRollbackSafety(cfg *config.Config) error {
+	for _, cmd := range cfg.Commands {
+		switch cmd.Type {
+		case config.CmdIPRoute2, config.CmdIfShortcut, config.CmdIPShortcut, config.CmdRouteShortcut:
+			args := config.ExpandCommand(cmd)
+			if err := validateRollbackableIPCommand(args); err != nil {
+				return fmt.Errorf("%s:%d: %w", cmd.File, cmd.LineNum, err)
+			}
+		}
+	}
+	return nil
+}
+
+func validateRollbackableIPCommand(args []string) error {
+	objectIndex, ok := ipCommandObjectIndex(args)
+	if !ok {
+		return fmt.Errorf("cannot determine iproute2 object and action for rollback")
+	}
+	object := canonicalIPObject(args[objectIndex])
+	action := canonicalIPWord(args[objectIndex+1], map[string]string{
+		"add": "add", "set": "set", "change": "set", "replace": "replace",
+		"delete": "delete", "del": "delete", "flush": "flush",
+	})
+
+	switch object {
+	case "link":
+		switch action {
+		case "add":
+			if linkAddName(args, objectIndex) == "" {
+				return fmt.Errorf("link add requires an explicit interface name for rollback")
+			}
+			return nil
+		case "set":
+			return validateRollbackableLinkSet(args, objectIndex)
+		case "delete", "flush":
+			return fmt.Errorf("ip link %s is not supported because a removed link cannot be safely restored", action)
+		default:
+			return fmt.Errorf("ip link %s is not supported by rollback-safe configuration", args[objectIndex+1])
+		}
+
+	case "address", "route", "rule":
+		if action == "add" || action == "replace" {
+			return nil
+		}
+		return fmt.Errorf("ip %s %s is not supported by rollback-safe configuration", object, args[objectIndex+1])
+
+	default:
+		return fmt.Errorf("ip %s is not supported by rollback-safe configuration", args[objectIndex])
+	}
+}
+
+func validateRollbackableLinkSet(args []string, objectIndex int) error {
+	position, ok := linkSetPropertyIndex(args, objectIndex)
+	if !ok {
+		return fmt.Errorf("ip link set requires an interface and a property")
+	}
+
+	for position < len(args) {
+		switch args[position] {
+		case "up", "down", "nomaster":
+			position++
+		case "mtu", "address", "master":
+			if position+1 >= len(args) {
+				return fmt.Errorf("ip link set %s requires a value", args[position])
+			}
+			position += 2
+		default:
+			return fmt.Errorf("ip link set %s is not supported because it cannot be safely restored", args[position])
+		}
+	}
+	return nil
+}
+
+func linkSetPropertyIndex(args []string, objectIndex int) (int, bool) {
+	position := objectIndex + 2
+	if position < len(args) && args[position] == "dev" {
+		position++
+	}
+	if position >= len(args) {
+		return 0, false
+	}
+	position++ // interface name
+	return position, position < len(args)
+}
+
+func ipCommandObjectIndex(args []string) (int, bool) {
+	index := 0
+	for index < len(args) && (args[index] == "-4" || args[index] == "-6") {
+		index++
+	}
+	return index, index+1 < len(args)
+}
+
+func linkAddName(args []string, objectIndex int) string {
+	start := objectIndex + 2
+	for i := start; i < len(args) && args[i] != "type"; i++ {
+		switch args[i] {
+		case "name", "dev":
+			if i+1 < len(args) && args[i+1] != "type" {
+				return args[i+1]
+			}
+			return ""
+		case "link", "address", "broadcast", "index", "mtu", "numtxqueues",
+			"numrxqueues", "txqueuelen", "group", "netns":
+			// Creation options before "type" consume one value. In
+			// particular, "link" names the parent rather than the link
+			// being created.
+			i++
+		default:
+			if i == start {
+				return args[i]
+			}
+		}
+	}
+	return ""
 }
 
 func canonicalIPObject(word string) string {
@@ -760,7 +999,7 @@ func cmdReload(configPath string, cmdArgs []string) error {
 	}
 
 	if control.IsDaemonRunning() {
-		if err := requestDaemonReload(configPath, options.timeout); err != nil {
+		if err := requestDaemonReloadLoaded(configPath, cfg, options.timeout); err != nil {
 			return err
 		}
 	} else {
@@ -865,21 +1104,66 @@ func changeConfigurationLoaded(_ string, cfg *config.Config, daemonMode bool, ti
 }
 
 func requestDaemonReload(configPath string, timeout int) error {
-	id := control.NewRequestID()
-	request := control.ReloadRequest{ID: id, ConfigPath: configPath, Timeout: timeout}
-	_ = os.Remove(control.ReloadResponsePath)
-	if err := control.WriteJSONAtomic(control.ReloadRequestPath, request, 0600); err != nil {
-		return err
+	cfg, err := config.Load(configPath)
+	if err != nil {
+		return fmt.Errorf("load config: %w", err)
 	}
-	if err := control.SignalDaemon(syscall.SIGHUP); err != nil {
-		_ = os.Remove(control.ReloadRequestPath)
-		return err
-	}
-	return control.WaitResponse(control.ReloadResponsePath, id, 2*time.Minute)
+	return requestDaemonReloadLoaded(configPath, cfg, timeout)
 }
 
-func cmdStatus() {
-	state.PrintStatus(os.Stdout)
+// requestDaemonReloadLoaded sends the exact configuration the CLI reviewed to
+// the daemon. The daemon reads the protected snapshot rather than reopening a
+// relative path or a file that may have changed after confirmation.
+func requestDaemonReloadLoaded(configPath string, cfg *config.Config, timeout int) error {
+	release, err := control.ClaimReload()
+	if err != nil {
+		return err
+	}
+	defer release()
+	daemonRecord, err := control.DaemonRecord()
+	if err != nil {
+		return err
+	}
+
+	id := control.NewRequestID()
+	snapshotPath := filepath.Join(control.RunDir, "reload-"+id+".json")
+	if err := config.SaveSnapshot(snapshotPath, cfg); err != nil {
+		return fmt.Errorf("save reload snapshot: %w", err)
+	}
+	request := control.ReloadRequest{
+		ID:           id,
+		ConfigPath:   configPath,
+		SnapshotPath: snapshotPath,
+		Timeout:      timeout,
+		Daemon:       daemonRecord,
+	}
+	_ = os.Remove(control.ReloadResponsePath)
+	if err := control.WriteJSONAtomic(control.ReloadRequestPath, request, 0600); err != nil {
+		_ = os.Remove(snapshotPath)
+		return err
+	}
+	if err := control.SignalProcessRecord(daemonRecord, syscall.SIGHUP); err != nil {
+		_ = os.Remove(control.ReloadRequestPath)
+		_ = os.Remove(snapshotPath)
+		return err
+	}
+	if err := control.WaitResponse(control.ReloadResponsePath, id, 2*time.Minute); err != nil {
+		// If the daemon never claimed this request, make sure a later raw HUP
+		// cannot apply it. The snapshot is deliberately left for startup's
+		// orphan cleanup because the daemon may have read the request already.
+		var pending control.ReloadRequest
+		if control.ReadJSON(control.ReloadRequestPath, &pending) == nil && pending.ID == id {
+			_ = os.Remove(control.ReloadRequestPath)
+		}
+		return err
+	}
+	return nil
+}
+
+func cmdStatus() error {
+	if err := state.PrintStatus(os.Stdout); err != nil {
+		return err
+	}
 
 	// WiFi
 	fmt.Printf("\n%s\n", color.Bold("WiFi:"))
@@ -890,6 +1174,7 @@ func cmdStatus() {
 		fmt.Printf("\n%s run 'nic confirm' to keep current configuration\n",
 			color.BoldYellow("[!] Pending revert —"))
 	}
+	return nil
 }
 
 func cmdShow(configPath string) error {
@@ -967,37 +1252,162 @@ func confirm() bool {
 	return input == "y" || input == "yes"
 }
 
-func runDaemon(configPath string) error {
-	sigChan := make(chan os.Signal, 2)
-	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP, syscall.SIGUSR1)
-	defer signal.Stop(sigChan)
+// notifySystemd implements the small sd_notify protocol directly so nic can
+// report readiness only after its network configuration has succeeded. It is a
+// no-op outside a systemd service.
+func notifySystemd(message string) error {
+	socket := os.Getenv("NOTIFY_SOCKET")
+	if socket == "" {
+		return nil
+	}
+	if !strings.HasPrefix(socket, "/") && !strings.HasPrefix(socket, "@") {
+		return fmt.Errorf("invalid NOTIFY_SOCKET")
+	}
+	if strings.HasPrefix(socket, "@") {
+		// Linux abstract Unix sockets are represented by a leading NUL byte.
+		socket = "\x00" + strings.TrimPrefix(socket, "@")
+	}
+	conn, err := net.DialUnix("unixgram", nil, &net.UnixAddr{Name: socket, Net: "unixgram"})
+	if err != nil {
+		return err
+	}
+	defer func() { _ = conn.Close() }()
+	_, err = conn.Write([]byte(message))
+	return err
+}
 
+func isManagedReloadSnapshot(path string) bool {
+	clean := filepath.Clean(path)
+	if path == "" || filepath.Dir(clean) != filepath.Clean(control.RunDir) {
+		return false
+	}
+	base := filepath.Base(clean)
+	if !strings.HasPrefix(base, "reload-") || !strings.HasSuffix(base, ".json") {
+		return false
+	}
+	id := strings.TrimSuffix(strings.TrimPrefix(base, "reload-"), ".json")
+	parts := strings.Split(id, "-")
+	if len(parts) != 2 {
+		return false
+	}
+	for _, part := range parts {
+		if _, err := strconv.ParseUint(part, 10, 64); err != nil {
+			return false
+		}
+	}
+	return true
+}
+
+func removeManagedReloadSnapshot(path string) error {
+	if !isManagedReloadSnapshot(path) {
+		return nil
+	}
+	if err := os.Remove(filepath.Clean(path)); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	return nil
+}
+
+func discardStaleReloadArtifacts(current control.PIDRecord) error {
+	var cleanupErrors []error
+	preservedSnapshot := ""
+	var request control.ReloadRequest
+	requestErr := control.ReadJSON(control.ReloadRequestPath, &request)
+	if requestErr == nil && request.Daemon == current {
+		if isManagedReloadSnapshot(request.SnapshotPath) {
+			preservedSnapshot = filepath.Clean(request.SnapshotPath)
+		}
+	} else {
+		if requestErr == nil {
+			cleanupErrors = append(cleanupErrors, removeManagedReloadSnapshot(request.SnapshotPath))
+		}
+		if err := os.Remove(control.ReloadRequestPath); err != nil && !os.IsNotExist(err) {
+			cleanupErrors = append(cleanupErrors, err)
+		}
+	}
+
+	entries, err := os.ReadDir(control.RunDir)
+	if err != nil && !os.IsNotExist(err) {
+		cleanupErrors = append(cleanupErrors, err)
+	}
+	for _, entry := range entries {
+		path := filepath.Join(control.RunDir, entry.Name())
+		if entry.IsDir() || !isManagedReloadSnapshot(path) || filepath.Clean(path) == preservedSnapshot {
+			continue
+		}
+		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+			cleanupErrors = append(cleanupErrors, err)
+		}
+	}
+	if err := os.Remove(control.ReloadResponsePath); err != nil && !os.IsNotExist(err) {
+		cleanupErrors = append(cleanupErrors, err)
+	}
+	return errors.Join(cleanupErrors...)
+}
+
+func rejectReloadDuringStartup() {
+	var request control.ReloadRequest
+	if err := control.ReadJSON(control.ReloadRequestPath, &request); err != nil {
+		fmt.Fprintln(os.Stderr, "reload ignored: no daemon reload request")
+		return
+	}
+	_ = os.Remove(control.ReloadRequestPath)
+	_ = removeManagedReloadSnapshot(request.SnapshotPath)
+	response := control.Response{ID: request.ID, Error: "daemon startup is still in progress"}
+	if err := control.WriteJSONAtomic(control.ReloadResponsePath, response, 0600); err != nil {
+		fmt.Fprintf(os.Stderr, "reload response: %v\n", err)
+	}
+}
+
+func runDaemon(configPath string, sigChan <-chan os.Signal) error {
+	daemonRecord, err := control.RecordForPID(os.Getpid())
+	if err != nil {
+		return fmt.Errorf("identify daemon process: %w", err)
+	}
 	for sig := range sigChan {
 		switch sig {
 		case syscall.SIGINT, syscall.SIGTERM:
 			fmt.Println("\nShutting down gracefully...")
-			return stopManagedConfig("")
+			_ = notifySystemd("STOPPING=1\nSTATUS=nic is restoring the managed network state")
+			return stopManagedConfigBounded("")
 
 		case syscall.SIGHUP:
-			request := control.ReloadRequest{ConfigPath: configPath}
+			var request control.ReloadRequest
 			hasRequest := control.ReadJSON(control.ReloadRequestPath, &request) == nil
-			if hasRequest {
-				_ = os.Remove(control.ReloadRequestPath)
+			if !hasRequest {
+				// Reloads must arrive through the control request so the daemon
+				// never reopens an unreviewed on-disk configuration on a raw HUP.
+				fmt.Fprintln(os.Stderr, "reload ignored: no daemon reload request")
+				continue
 			}
+			_ = os.Remove(control.ReloadRequestPath)
 			if request.ConfigPath == "" {
 				request.ConfigPath = configPath
 			}
-			err := changeConfiguration(request.ConfigPath, true, request.Timeout)
-			if hasRequest {
-				response := control.Response{ID: request.ID}
-				if err != nil {
-					response.Error = err.Error()
+			var reloadErr error
+			switch {
+			case request.Daemon != daemonRecord:
+				_ = removeManagedReloadSnapshot(request.SnapshotPath)
+				reloadErr = fmt.Errorf("reload request targets a different daemon instance")
+			case !isManagedReloadSnapshot(request.SnapshotPath):
+				reloadErr = fmt.Errorf("reload request has an invalid configuration snapshot path")
+			default:
+				cfg, loadErr := config.LoadSnapshot(request.SnapshotPath)
+				// Once the daemon has opened the snapshot, it owns cleanup. Keep it
+				// until this point so a client timing out cannot race the daemon.
+				_ = removeManagedReloadSnapshot(request.SnapshotPath)
+				if loadErr != nil {
+					reloadErr = fmt.Errorf("load requested configuration snapshot: %w", loadErr)
+				} else {
+					reloadErr = changeConfigurationLoaded(request.ConfigPath, cfg, true, request.Timeout)
 				}
-				if writeErr := control.WriteJSONAtomic(control.ReloadResponsePath, response, 0600); writeErr != nil {
-					fmt.Fprintf(os.Stderr, "reload response: %v\n", writeErr)
-				}
-			} else if err != nil {
-				fmt.Fprintf(os.Stderr, "reload failed: %v\n", err)
+			}
+			response := control.Response{ID: request.ID}
+			if reloadErr != nil {
+				response.Error = reloadErr.Error()
+			}
+			if writeErr := control.WriteJSONAtomic(control.ReloadResponsePath, response, 0600); writeErr != nil {
+				fmt.Fprintf(os.Stderr, "reload response: %v\n", writeErr)
 			}
 
 		case syscall.SIGUSR1:
@@ -1039,12 +1449,18 @@ func restoreSavedSnapshot(statePath, configPath string, daemonMode bool) error {
 		restoreErrors = append(restoreErrors, err)
 	}
 
+	var previousDNS dns.ManagedState
+	previousReapplied := false
 	previous, configErr := config.LoadSnapshot(configPath)
 	if configErr == nil {
 		if err := applyConfig(previous, daemonMode); err != nil {
 			restoreErrors = append(restoreErrors, fmt.Errorf("reapply previous configuration: %w", err))
-		} else if err := config.SaveSnapshot(control.AppliedConfigPath, previous); err != nil {
-			restoreErrors = append(restoreErrors, fmt.Errorf("save previous configuration: %w", err))
+		} else {
+			previousDNS = dns.CaptureManagedState()
+			previousReapplied = true
+			if err := config.SaveSnapshot(control.AppliedConfigPath, previous); err != nil {
+				restoreErrors = append(restoreErrors, fmt.Errorf("save previous configuration: %w", err))
+			}
 		}
 	} else if os.IsNotExist(configErr) {
 		_ = os.Remove(control.AppliedConfigPath)
@@ -1054,6 +1470,11 @@ func restoreSavedSnapshot(statePath, configPath string, daemonMode bool) error {
 
 	if err := state.RestoreState(statePath); err != nil {
 		restoreErrors = append(restoreErrors, fmt.Errorf("restore captured state: %w", err))
+	}
+	if previousReapplied {
+		if err := dns.RestoreManagedState(previousDNS); err != nil {
+			restoreErrors = append(restoreErrors, fmt.Errorf("restore managed DNS policy: %w", err))
+		}
 	}
 	if len(restoreErrors) == 0 {
 		_ = os.Remove(control.PendingConfigPath)

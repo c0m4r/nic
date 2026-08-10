@@ -20,10 +20,14 @@ var (
 	BaseStatePath      = RunDir + "/base-state.json"
 	ReloadRequestPath  = RunDir + "/reload-request.json"
 	ReloadResponsePath = RunDir + "/reload-response.json"
+	ReloadLockPath     = RunDir + "/reload.lock"
 	RevertResponsePath = RunDir + "/revert-response.json"
 )
 
-var ErrNotRunning = errors.New("nic daemon is not running")
+var (
+	ErrNotRunning       = errors.New("nic daemon is not running")
+	ErrReloadInProgress = errors.New("nic reload is already in progress")
+)
 
 type PIDRecord struct {
 	PID       int    `json:"pid"`
@@ -31,9 +35,11 @@ type PIDRecord struct {
 }
 
 type ReloadRequest struct {
-	ID         string `json:"id"`
-	ConfigPath string `json:"config_path"`
-	Timeout    int    `json:"timeout"`
+	ID           string    `json:"id"`
+	ConfigPath   string    `json:"config_path"`
+	SnapshotPath string    `json:"snapshot_path,omitempty"`
+	Timeout      int       `json:"timeout"`
+	Daemon       PIDRecord `json:"daemon"`
 }
 
 type Response struct {
@@ -72,7 +78,39 @@ func SignalProcessRecord(record PIDRecord, sig syscall.Signal) error {
 	if err != nil {
 		return ErrNotRunning
 	}
-	return proc.Signal(sig)
+	if err := proc.Signal(sig); err != nil {
+		if errors.Is(err, os.ErrProcessDone) || errors.Is(err, syscall.ESRCH) {
+			return ErrNotRunning
+		}
+		return err
+	}
+	return nil
+}
+
+// WaitProcessRecord waits for the exact recorded process to exit. The start
+// time check prevents a recycled PID from being mistaken for the process that
+// nic originally launched.
+func WaitProcessRecord(record PIDRecord, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	for {
+		if !recordIsLive(record) {
+			return nil
+		}
+		if !time.Now().Before(deadline) {
+			return fmt.Errorf("timed out waiting for process %d to stop", record.PID)
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+}
+
+// TerminateProcessRecord signals a tracked process and waits until it has
+// actually exited. Callers must keep their PID/configuration records when this
+// returns an error so a live process cannot be replaced by a second instance.
+func TerminateProcessRecord(record PIDRecord, sig syscall.Signal, timeout time.Duration) error {
+	if err := SignalProcessRecord(record, sig); err != nil && !errors.Is(err, ErrNotRunning) {
+		return err
+	}
+	return WaitProcessRecord(record, timeout)
 }
 
 func ProcessExecutableName(pid int) (string, error) {
@@ -133,6 +171,17 @@ func ClaimDaemon() (func(), error) {
 func IsDaemonRunning() bool {
 	record, err := readPIDRecord()
 	return err == nil && recordIsLive(record)
+}
+
+// DaemonRecord returns the identity of the currently running daemon. The
+// process start time makes the identity safe even if the kernel later reuses
+// its PID.
+func DaemonRecord() (PIDRecord, error) {
+	record, err := readPIDRecord()
+	if err != nil || !recordIsLive(record) {
+		return PIDRecord{}, ErrNotRunning
+	}
+	return record, nil
 }
 
 func SignalDaemon(sig syscall.Signal) error {
@@ -237,6 +286,30 @@ func WaitResponse(path, id string, timeout time.Duration) error {
 	return fmt.Errorf("timed out waiting for daemon response")
 }
 
+// ClaimReload serializes CLI reload requests. A file lock is automatically
+// released if the requesting process exits, so it cannot leave a stale lock
+// that blocks future network changes.
+func ClaimReload() (func(), error) {
+	if err := os.MkdirAll(RunDir, 0755); err != nil {
+		return nil, err
+	}
+	f, err := os.OpenFile(ReloadLockPath, os.O_CREATE|os.O_RDWR, 0600)
+	if err != nil {
+		return nil, err
+	}
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		_ = f.Close()
+		if errors.Is(err, syscall.EWOULDBLOCK) || errors.Is(err, syscall.EAGAIN) {
+			return nil, ErrReloadInProgress
+		}
+		return nil, err
+	}
+	return func() {
+		_ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
+		_ = f.Close()
+	}, nil
+}
+
 func NewRequestID() string {
 	return fmt.Sprintf("%d-%d", os.Getpid(), time.Now().UnixNano())
 }
@@ -280,26 +353,31 @@ func recordIsLive(record PIDRecord) bool {
 	if record.PID <= 0 || record.StartTime == "" {
 		return false
 	}
-	start, err := processStartTime(record.PID)
-	return err == nil && start == record.StartTime
+	start, state, err := processStartState(record.PID)
+	return err == nil && state != "Z" && start == record.StartTime
 }
 
 func processStartTime(pid int) (string, error) {
+	start, _, err := processStartState(pid)
+	return start, err
+}
+
+func processStartState(pid int) (string, string, error) {
 	data, err := os.ReadFile(fmt.Sprintf("/proc/%d/stat", pid))
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
 	// The second field is parenthesized and may itself contain spaces.
 	end := strings.LastIndexByte(string(data), ')')
 	if end == -1 || end+2 >= len(data) {
-		return "", fmt.Errorf("invalid /proc/%d/stat", pid)
+		return "", "", fmt.Errorf("invalid /proc/%d/stat", pid)
 	}
 	fields := strings.Fields(string(data[end+2:]))
 	// fields starts at field 3; process start time is field 22.
 	if len(fields) <= 19 {
-		return "", fmt.Errorf("invalid /proc/%d/stat", pid)
+		return "", "", fmt.Errorf("invalid /proc/%d/stat", pid)
 	}
-	return fields[19], nil
+	return fields[19], fields[0], nil
 }
 
 func removeIfOwned(record PIDRecord) {

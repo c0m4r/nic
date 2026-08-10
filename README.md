@@ -7,7 +7,7 @@ Replaces systemd-networkd, netplan, and `/etc/network/interfaces` with one confi
 ## Features
 
 - Declarative config at `/etc/nic.conf`
-- Full iproute2 pass-through (including abbreviated syntax like `ip l s eth0 up`)
+- Rollback-safe iproute2 commands (including abbreviated syntax like `ip l s eth0 up`)
 - Shortcut syntax for common operations
 - Interface aliasing and MAC pinning
 - Built-in DHCP client with fallback (dhclient, dhcpcd, udhcpc)
@@ -34,6 +34,9 @@ sudo make install-runit      # runit
 The systemd installer does not stop or mask the existing network stack. After
 validating `/etc/nic.conf`, either disable conflicting services yourself or run
 `sudo NIC_DISABLE_SYSTEM_SERVICES=1 make install-systemd`.
+When that opt-in mode masks `systemd-resolved`, it replaces only its runtime
+`/etc/resolv.conf` symlink with a regular resolver file; administrator-managed
+resolver files and other symlink targets are left unchanged.
 
 For staged/package installs, all targets honor `DESTDIR`; `PREFIX`,
 `SYSCONFDIR`, and init-directory variables can also be overridden.
@@ -121,7 +124,9 @@ nameserver 1.1.1.1
 ns 8.8.8.8
 ```
 
-Writes `/etc/resolv.conf` and protects it with `chattr +i`.
+Writes `/etc/resolv.conf` and protects it with `chattr +i`. Static
+`nameserver` entries take precedence over DHCP-provided entries; without
+static entries, DNS from active DHCP sessions is merged deterministically.
 
 ### DHCP
 
@@ -147,7 +152,8 @@ Uses wpa_supplicant or iwd, with WPA3 (SAE) support.
 
 Because the configuration contains the WiFi passphrase, every file containing
 a `wifi` directive must be owned appropriately and have mode `0600`. Passwords
-are supplied to helper programs without placing them in command-line arguments.
+are never placed in command-line arguments and are stored only in protected
+runtime backend configuration.
 
 ### Aliases and MAC pinning
 
@@ -210,6 +216,12 @@ the pre-nic baseline, and then applies the desired state. Removed addresses,
 routes, links, DNS entries, DHCP sessions, and WiFi connections therefore do
 not linger. Use `--no-rollback` only in automation that intentionally accepts
 the new configuration immediately.
+
+To keep that rollback guarantee, passthrough accepts link creation and the
+restorable link settings (`up`/`down`, `mtu`, MAC address, and master), plus
+address, route, and rule `add`/`replace` commands. Destructive operations such
+as `ip link delete`, interface renames, namespace moves, and unsupported
+iproute2 objects are rejected instead of being applied without a safe inverse.
 
 ```sh
 sudo nic restart --confirm-timeout=30

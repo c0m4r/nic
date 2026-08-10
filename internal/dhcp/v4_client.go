@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"math/rand/v2"
 	"net"
@@ -13,6 +14,8 @@ import (
 	"time"
 	"unsafe"
 )
+
+var errDHCPv4NAK = errors.New("DHCP server NAK")
 
 // runDHCPv4 performs the full DORA exchange and returns a lease.
 func runDHCPv4(ctx context.Context, iface string) (*Lease, error) {
@@ -80,6 +83,9 @@ func doDiscover(ctx context.Context, fd int, mac net.HardwareAddr, xid uint32, i
 		if err == nil {
 			return offer, nil
 		}
+		if errors.Is(err, errDHCPv4NAK) {
+			return nil, err
+		}
 
 		timeout *= 2 // exponential backoff
 	}
@@ -106,6 +112,9 @@ func doRequest(ctx context.Context, fd int, mac net.HardwareAddr, xid uint32, if
 		if err == nil {
 			return ack, nil
 		}
+		if errors.Is(err, errDHCPv4NAK) {
+			return nil, err
+		}
 	}
 
 	return nil, fmt.Errorf("no DHCP ack received")
@@ -118,15 +127,22 @@ func renewLease(iface string, lease *Lease) (*Lease, error) {
 		return nil, err
 	}
 
-	serverAddr := lease.ServerIP + ":67"
-	conn, err := net.DialTimeout("udp4", serverAddr, 5*time.Second)
+	localAddr, serverAddr, err := v4LeaseUDPAddrs(lease)
+	if err != nil {
+		return nil, err
+	}
+
+	// DHCP servers send renewal replies to UDP port 68. Binding the socket to
+	// the leased address and that port also ensures the request uses the correct
+	// source address on a multi-homed host.
+	conn, err := net.DialUDP("udp4", localAddr, serverAddr)
 	if err != nil {
 		return nil, fmt.Errorf("dial server: %w", err)
 	}
 	defer func() { _ = conn.Close() }()
 
 	xid := rand.Uint32()
-	request := buildRenew(mac, xid, net.ParseIP(lease.IP))
+	request := buildRenew(mac, xid, localAddr.IP)
 
 	_ = conn.SetDeadline(time.Now().Add(10 * time.Second))
 	if _, err := conn.Write(request); err != nil {
@@ -148,13 +164,108 @@ func renewLease(iface string, lease *Lease) (*Lease, error) {
 	}
 
 	if pkt.messageType() == msgNak {
-		return nil, fmt.Errorf("server NAK'd renewal")
+		return nil, fmt.Errorf("renewal: %w", errDHCPv4NAK)
 	}
 	if pkt.messageType() != msgAck {
 		return nil, fmt.Errorf("unexpected message type %d", pkt.messageType())
 	}
 
-	return parseLease(iface, pkt)
+	return parseRenewedLease(iface, pkt, lease)
+}
+
+func v4LeaseUDPAddrs(lease *Lease) (*net.UDPAddr, *net.UDPAddr, error) {
+	serverIP := net.ParseIP(lease.ServerIP).To4()
+	if serverIP == nil {
+		return nil, nil, fmt.Errorf("invalid DHCP server address %q", lease.ServerIP)
+	}
+	clientIP := net.ParseIP(lease.IP).To4()
+	if clientIP == nil || clientIP.Equal(net.IPv4zero) {
+		return nil, nil, fmt.Errorf("invalid DHCP client address %q", lease.IP)
+	}
+	return &net.UDPAddr{IP: clientIP, Port: 68}, &net.UDPAddr{IP: serverIP, Port: 67}, nil
+}
+
+// rebindLease broadcasts a DHCPREQUEST after T2. Unlike renewal, rebinding
+// intentionally has no server identifier so another DHCP server can take over
+// the lease.
+func rebindLease(ctx context.Context, iface string, lease *Lease) (*Lease, error) {
+	mac, ifIndex, err := getIfaceInfo(iface)
+	if err != nil {
+		return nil, err
+	}
+	clientIP := net.ParseIP(lease.IP).To4()
+	if clientIP == nil || clientIP.Equal(net.IPv4zero) {
+		return nil, fmt.Errorf("invalid DHCP client address %q", lease.IP)
+	}
+
+	fd, err := openRawSocket(ifIndex)
+	if err != nil {
+		return nil, fmt.Errorf("open raw socket: %w", err)
+	}
+	defer func() { _ = syscall.Close(fd) }()
+
+	xid := rand.Uint32()
+	packet := wrapUDPIPFromTo(buildRebind(mac, xid, clientIP), clientIP, net.IPv4bcast)
+	timeout := 4 * time.Second
+	for attempt := 0; attempt < 4; attempt++ {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		if err := sendBroadcast(fd, packet, ifIndex); err != nil {
+			return nil, fmt.Errorf("send rebind: %w", err)
+		}
+		ack, err := recvResponse(ctx, fd, xid, mac, msgAck, timeout)
+		if err == nil {
+			return parseRenewedLease(iface, ack, lease)
+		}
+		if errors.Is(err, errDHCPv4NAK) {
+			return nil, err
+		}
+		timeout *= 2
+	}
+	return nil, fmt.Errorf("no DHCP rebind ack received")
+}
+
+// parseRenewedLease preserves values that a DHCPACK is allowed to omit during
+// a renewal or rebind exchange. In particular, yiaddr is commonly zero when
+// the client identifies the lease through ciaddr.
+func parseRenewedLease(iface string, ack *v4Packet, previous *Lease) (*Lease, error) {
+	lease, err := parseLease(iface, ack)
+	if err != nil {
+		return nil, err
+	}
+	if previous == nil {
+		return lease, nil
+	}
+
+	if ack.YIAddr.To4() == nil || ack.YIAddr.To4().Equal(net.IPv4zero) {
+		lease.IP = previous.IP
+	}
+	if len(ack.getOption(optSubnetMask)) != 4 {
+		lease.SubnetMask = previous.SubnetMask
+	}
+	if len(ack.getOption(optRouter)) < 4 {
+		lease.Router = previous.Router
+	}
+	if len(ack.getOption(optDNS)) < 4 {
+		lease.DNS = append([]string(nil), previous.DNS...)
+	}
+	if len(ack.getOption(optDomainName)) == 0 {
+		lease.Domain = previous.Domain
+	}
+	if len(ack.getOption(optServerID)) != 4 {
+		lease.ServerIP = previous.ServerIP
+	}
+	if len(ack.getOption(optLeaseTime)) != 4 {
+		lease.LeaseTime = previous.LeaseTime
+	}
+	if len(ack.getOption(optRenewalTime)) != 4 {
+		lease.RenewTime = previous.RenewTime
+	}
+	if len(ack.getOption(optRebindingTime)) != 4 {
+		lease.RebindTime = previous.RebindTime
+	}
+	return lease, nil
 }
 
 // parseLease extracts lease information from a DHCPACK packet.
@@ -250,8 +361,7 @@ func recvResponse(ctx context.Context, fd int, xid uint32, mac net.HardwareAddr,
 			return nil, fmt.Errorf("timeout")
 		}
 		tv := syscall.NsecToTimeval(pollTimeout.Nanoseconds())
-		// #nosec G103 -- unsafe.Sizeof on fixed-size struct is safe
-		if err := setsockopt(fd, syscall.SOL_SOCKET, syscall.SO_RCVTIMEO, unsafe.Pointer(&tv), uint32(unsafe.Sizeof(tv))); err != nil {
+		if err := syscall.SetsockoptTimeval(fd, syscall.SOL_SOCKET, syscall.SO_RCVTIMEO, &tv); err != nil {
 			return nil, fmt.Errorf("set receive timeout: %w", err)
 		}
 		n, _, err := syscall.Recvfrom(fd, buf, 0)
@@ -282,7 +392,7 @@ func recvResponse(ctx context.Context, fd int, xid uint32, mac net.HardwareAddr,
 		}
 
 		if pkt.messageType() == msgNak {
-			return nil, fmt.Errorf("server NAK")
+			return nil, errDHCPv4NAK
 		}
 	}
 
@@ -294,18 +404,6 @@ func minDuration(a, b time.Duration) time.Duration {
 		return a
 	}
 	return b
-}
-
-func setsockopt(fd, level, name int, val unsafe.Pointer, vallen uint32) error {
-	_, _, errno := syscall.Syscall6(
-		syscall.SYS_SETSOCKOPT,
-		uintptr(fd), uintptr(level), uintptr(name),
-		uintptr(val), uintptr(vallen), 0,
-	)
-	if errno != 0 {
-		return errno
-	}
-	return nil
 }
 
 // Helper functions.

@@ -1,3 +1,3 @@
 module github.com/c0m4r/nic
 
-go 1.26.5
+go 1.22

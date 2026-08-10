@@ -1,13 +1,16 @@
 package state
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"time"
 
 	"github.com/c0m4r/nic/internal/color"
 	"github.com/c0m4r/nic/internal/dns"
@@ -31,13 +34,15 @@ type AddrEntry struct {
 }
 
 type AddrInfo struct {
-	Family    string `json:"family"`
-	Local     string `json:"local"`
-	PrefixLen int    `json:"prefixlen"`
-	Scope     string `json:"scope"`
-	Label     string `json:"label"`
-	Dynamic   bool   `json:"dynamic"`
-	Tentative bool   `json:"tentative"`
+	Family            string          `json:"family"`
+	Local             string          `json:"local"`
+	PrefixLen         int             `json:"prefixlen"`
+	Scope             string          `json:"scope"`
+	Label             string          `json:"label"`
+	Dynamic           bool            `json:"dynamic"`
+	Tentative         bool            `json:"tentative"`
+	ValidLifeTime     json.RawMessage `json:"valid_life_time,omitempty"`
+	PreferredLifeTime json.RawMessage `json:"preferred_life_time,omitempty"`
 }
 
 type Route struct {
@@ -55,6 +60,7 @@ type Route struct {
 
 // NetworkState holds a snapshot of the network configuration.
 type NetworkState struct {
+	CapturedAt  time.Time    `json:"captured_at,omitempty"`
 	Interfaces  []Interface  `json:"interfaces"`
 	Addresses   []AddrEntry  `json:"addresses"`
 	Routes      []Route      `json:"routes"`
@@ -132,6 +138,7 @@ func GetRoutes6() ([]Route, error) {
 
 // Capture takes a full snapshot of current network state.
 func Capture() (*NetworkState, error) {
+	capturedAt := time.Now()
 	ifaces, ifacesErr := GetInterfaces()
 	addrs, addrsErr := GetAddresses()
 	routes, routesErr := GetRoutes()
@@ -147,6 +154,7 @@ func Capture() (*NetworkState, error) {
 	}
 
 	return &NetworkState{
+		CapturedAt:  capturedAt,
 		Interfaces:  ifaces,
 		Addresses:   addrs,
 		Routes:      routes,
@@ -259,6 +267,11 @@ func RestoreState(path string) error {
 		}
 	}
 
+	// Address lifetimes reported by ip are relative to the capture time. Reduce
+	// them by the snapshot's age so rollback cannot resurrect an expired
+	// DHCP/SLAAC address with its old full lifetime.
+	elapsedLifetime := elapsedLifetimeSeconds(st.CapturedAt, time.Now())
+
 	// Restore addresses.
 	for _, entry := range st.Addresses {
 		if entry.IfName == "lo" {
@@ -276,7 +289,16 @@ func RestoreState(path string) error {
 			if addr.Label != "" && addr.Label != entry.IfName {
 				args = append(args, "label", addr.Label)
 			}
-			_, err := executor.RunIP(args...)
+			lifetimeArgs, restore, err := restoreLifetimeArgs(addr, elapsedLifetime)
+			if err != nil {
+				addError("restore address "+cidr, err)
+				continue
+			}
+			if !restore {
+				continue
+			}
+			args = append(args, lifetimeArgs...)
+			_, err = executor.RunIP(args...)
 			addError("restore address "+cidr, err)
 		}
 	}
@@ -331,6 +353,101 @@ func RestoreState(path string) error {
 
 	addError("restore DNS", dns.Restore(st.DNS))
 	return errors.Join(restoreErrors...)
+}
+
+func restoreLifetimeArgs(addr AddrInfo, elapsed uint64) ([]string, bool, error) {
+	valid, err := lifetimeArgument(addr.ValidLifeTime)
+	if err != nil {
+		return nil, false, fmt.Errorf("invalid valid_life_time: %w", err)
+	}
+	preferred, err := lifetimeArgument(addr.PreferredLifeTime)
+	if err != nil {
+		return nil, false, fmt.Errorf("invalid preferred_life_time: %w", err)
+	}
+
+	valid, expired, err := reduceLifetime(valid, elapsed)
+	if err != nil {
+		return nil, false, fmt.Errorf("invalid valid_life_time: %w", err)
+	}
+	if expired {
+		return nil, false, nil
+	}
+	preferred, _, err = reduceLifetime(preferred, elapsed)
+	if err != nil {
+		return nil, false, fmt.Errorf("invalid preferred_life_time: %w", err)
+	}
+
+	args := make([]string, 0, 4)
+	if valid != "" {
+		args = append(args, "valid_lft", valid)
+	}
+	if preferred != "" {
+		args = append(args, "preferred_lft", preferred)
+	}
+	return args, true, nil
+}
+
+func reduceLifetime(value string, elapsed uint64) (string, bool, error) {
+	if value == "" || value == "forever" {
+		return value, false, nil
+	}
+	seconds, err := strconv.ParseUint(value, 10, 32)
+	if err != nil {
+		return "", false, err
+	}
+	if seconds <= elapsed {
+		return "0", true, nil
+	}
+	return strconv.FormatUint(seconds-elapsed, 10), false, nil
+}
+
+func elapsedLifetimeSeconds(capturedAt, now time.Time) uint64 {
+	if capturedAt.IsZero() || !now.After(capturedAt) {
+		return 0
+	}
+	elapsed := now.Sub(capturedAt)
+	seconds := elapsed / time.Second
+	if elapsed%time.Second != 0 {
+		seconds++
+	}
+	return uint64(seconds)
+}
+
+func lifetimeArgument(raw json.RawMessage) (string, error) {
+	if len(raw) == 0 || bytes.Equal(raw, []byte("null")) {
+		return "", nil
+	}
+
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.UseNumber()
+	var value any
+	if err := decoder.Decode(&value); err != nil {
+		return "", err
+	}
+	if err := decoder.Decode(&struct{}{}); err != io.EOF {
+		if err == nil {
+			return "", fmt.Errorf("multiple values")
+		}
+		return "", err
+	}
+
+	switch value := value.(type) {
+	case json.Number:
+		if _, err := strconv.ParseUint(string(value), 10, 32); err != nil {
+			return "", err
+		}
+		return string(value), nil
+	case string:
+		if value == "forever" {
+			return value, nil
+		}
+		if _, err := strconv.ParseUint(value, 10, 32); err != nil {
+			return "", fmt.Errorf("want an unsigned number or forever")
+		}
+		return value, nil
+	default:
+		return "", fmt.Errorf("want an unsigned number or forever")
+	}
 }
 
 func restoreRouteLines(v6 bool, lines []string) error {
@@ -520,10 +637,26 @@ func colorizeAddr(addr string, family string) string {
 }
 
 // PrintStatus writes a formatted network status to the writer.
-func PrintStatus(w io.Writer) {
+func PrintStatus(w io.Writer) error {
+	servers, err := readResolv()
+	if err != nil {
+		return fmt.Errorf("read resolver configuration: %w", err)
+	}
+	addrs, err := GetAddresses()
+	if err != nil {
+		return fmt.Errorf("get addresses: %w", err)
+	}
+	routes, err := GetRoutes()
+	if err != nil {
+		return fmt.Errorf("get IPv4 routes: %w", err)
+	}
+	routes6, err := GetRoutes6()
+	if err != nil {
+		return fmt.Errorf("get IPv6 routes: %w", err)
+	}
+
 	// --- DNS ---
 	_, _ = fmt.Fprintf(w, "%s\n", color.Bold("DNS:"))
-	servers := readResolv()
 	if len(servers) == 0 {
 		_, _ = fmt.Fprintf(w, "  %s\n", color.Dim("(none)"))
 	}
@@ -533,7 +666,6 @@ func PrintStatus(w io.Writer) {
 
 	// --- Interfaces ---
 	_, _ = fmt.Fprintf(w, "\n%s\n", color.Bold("Interfaces:"))
-	addrs, _ := GetAddresses()
 	printed := 0
 	for _, entry := range addrs {
 		// Header line: name | state | mac (skip state for loopback)
@@ -583,19 +715,18 @@ func PrintStatus(w io.Writer) {
 
 	// --- IPv4 Routes ---
 	_, _ = fmt.Fprintf(w, "\n%s\n", color.Bold("Routes:"))
-	routes, _ := GetRoutes()
 	for _, r := range routes {
 		_, _ = fmt.Fprintln(w, formatRoute(r))
 	}
 
 	// --- IPv6 Routes ---
-	routes6, _ := GetRoutes6()
 	if len(routes6) > 0 {
 		_, _ = fmt.Fprintf(w, "\n%s\n", color.Bold("IPv6 Routes:"))
 		for _, r := range routes6 {
 			_, _ = fmt.Fprintln(w, formatRoute(r))
 		}
 	}
+	return nil
 }
 
 func formatRoute(r Route) string {
@@ -619,10 +750,13 @@ func formatRoute(r Route) string {
 	return line
 }
 
-func readResolv() []string {
+func readResolv() ([]string, error) {
 	data, err := os.ReadFile("/etc/resolv.conf")
+	if os.IsNotExist(err) {
+		return nil, nil
+	}
 	if err != nil {
-		return nil
+		return nil, err
 	}
 	var servers []string
 	for _, line := range strings.Split(string(data), "\n") {
@@ -634,5 +768,5 @@ func readResolv() []string {
 			}
 		}
 	}
-	return servers
+	return servers, nil
 }

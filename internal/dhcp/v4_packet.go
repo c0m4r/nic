@@ -243,6 +243,23 @@ func buildRenew(mac net.HardwareAddr, xid uint32, clientIP net.IP) []byte {
 	return p.marshal()
 }
 
+// buildRebind creates a broadcast DHCPREQUEST for the REBINDING state.  RFC
+// 2131 requires ciaddr to identify the existing lease and prohibits a server
+// identifier so that any server can extend it.
+func buildRebind(mac net.HardwareAddr, xid uint32, clientIP net.IP) []byte {
+	p := newV4Base(mac, xid)
+	p.CIAddr = clientIP.To4()
+	p.Options = []v4Option{
+		{optMessageType, []byte{msgRequest}},
+		{optParamRequestList, []byte{
+			optSubnetMask, optRouter, optDNS,
+			optDomainName, optLeaseTime,
+			optRenewalTime, optRebindingTime,
+		}},
+	}
+	return p.marshal()
+}
+
 // buildRelease creates a DHCPRELEASE packet.
 func buildRelease(mac net.HardwareAddr, clientIP, serverIP net.IP) []byte {
 	p := newV4Base(mac, xid0())
@@ -266,6 +283,13 @@ const (
 
 // wrapUDPIP wraps a DHCP payload in IP + UDP headers for raw socket transmission.
 func wrapUDPIP(payload []byte) []byte {
+	return wrapUDPIPFromTo(payload, net.IPv4zero, net.IPv4bcast)
+}
+
+// wrapUDPIPFromTo wraps a DHCP payload in IP + UDP headers with explicit
+// endpoints. It is used for REBINDING, where the client already has an IPv4
+// address and broadcasts to any available server.
+func wrapUDPIPFromTo(payload []byte, source, destination net.IP) []byte {
 	totalLen := ipHeaderLen + udpHeaderLen + len(payload)
 	buf := make([]byte, totalLen)
 
@@ -274,11 +298,8 @@ func wrapUDPIP(payload []byte) []byte {
 	binary.BigEndian.PutUint16(buf[2:4], uint16(totalLen))
 	buf[8] = 64 // TTL
 	buf[9] = 17 // UDP
-	// src: 0.0.0.0 (buf already zeroed)
-	buf[16] = 255 // dst: 255.255.255.255
-	buf[17] = 255
-	buf[18] = 255
-	buf[19] = 255
+	copy(buf[12:16], source.To4())
+	copy(buf[16:20], destination.To4())
 	binary.BigEndian.PutUint16(buf[10:12], ipChecksum(buf[:ipHeaderLen]))
 
 	// UDP header

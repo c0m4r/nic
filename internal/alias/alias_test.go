@@ -9,6 +9,8 @@ func TestAddAlias(t *testing.T) {
 	mgr := NewManager()
 	mgr.AddAlias("my_eth", "enp14s0")
 	mgr.AddAlias("mgmt", "eth0")
+	mgr.AddAlias("default", "wan0")
+	mgr.AddAlias("up", "lan0")
 
 	// Resolve without any pins should succeed
 	if err := mgr.Resolve(); err != nil {
@@ -30,6 +32,8 @@ func TestResolveInTokens(t *testing.T) {
 	mgr := NewManager()
 	mgr.AddAlias("my_eth", "enp14s0")
 	mgr.AddAlias("mgmt", "eth0")
+	mgr.AddAlias("default", "wan0")
+	mgr.AddAlias("up", "lan0")
 	_ = mgr.Resolve()
 
 	tests := []struct {
@@ -47,6 +51,22 @@ func TestResolveInTokens(t *testing.T) {
 		{
 			[]string{"link", "set", "eth1", "up"},
 			[]string{"link", "set", "eth1", "up"},
+		},
+		{
+			[]string{"route", "add", "default", "via", "192.0.2.1", "dev", "default"},
+			[]string{"route", "add", "default", "via", "192.0.2.1", "dev", "wan0"},
+		},
+		{
+			[]string{"link", "set", "up", "up"},
+			[]string{"link", "set", "lan0", "up"},
+		},
+		{
+			[]string{"link", "add", "link", "default", "name", "up", "type", "vlan", "id", "10"},
+			[]string{"link", "add", "link", "wan0", "name", "up", "type", "vlan", "id", "10"},
+		},
+		{
+			[]string{"rule", "add", "iif", "default", "oif", "up", "priority", "100"},
+			[]string{"rule", "add", "iif", "wan0", "oif", "lan0", "priority", "100"},
 		},
 		{
 			[]string{},

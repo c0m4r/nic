@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/c0m4r/nic/internal/control"
 	"github.com/c0m4r/nic/internal/executor"
@@ -20,6 +21,8 @@ var (
 	wpaConfDir    = "/run/nic/wifi"
 	iwdProfileDir = "/var/lib/iwd"
 )
+
+const wpaStopTimeout = 5 * time.Second
 
 type iwdProfileRecord struct {
 	Path    string      `json:"path"`
@@ -92,31 +95,19 @@ func connectWPASupplicant(ssid, password, iface string) error {
 	}
 	confFile := filepath.Join(wpaConfDir, iface+".conf")
 
-	// Generate config using wpa_passphrase if available
-	var confContent string
-	if executor.CommandExists("wpa_passphrase") {
-		output, err := executor.RunWithInput("wpa_passphrase", password+"\n", ssid)
-		if err != nil {
-			return fmt.Errorf("wpa_passphrase failed: %w", err)
-		}
-		var safeLines []string
-		for _, line := range strings.Split(output, "\n") {
-			if !strings.HasPrefix(strings.TrimSpace(line), "#psk=") {
-				safeLines = append(safeLines, line)
-			}
-		}
-		confContent = "ctrl_interface=/run/nic/wpa_ctrl\n" + strings.Join(safeLines, "\n")
-	} else {
-		// Manual config — supports WPA2/WPA3
-		quotedSSID, err := quoteWPAValue(ssid)
-		if err != nil {
-			return fmt.Errorf("invalid SSID: %w", err)
-		}
-		quotedPassword, err := quoteWPAValue(password)
-		if err != nil {
-			return fmt.Errorf("invalid passphrase: %w", err)
-		}
-		confContent = fmt.Sprintf(`ctrl_interface=/run/nic/wpa_ctrl
+	// Build the protected runtime configuration directly. wpa_passphrase reads
+	// its passphrase from a terminal and fails when stdin is a pipe, which makes
+	// it unsuitable for non-interactive service startup. A quoted passphrase is
+	// supported by wpa_supplicant for both WPA2-PSK and WPA3-SAE.
+	quotedSSID, err := quoteWPAValue(ssid)
+	if err != nil {
+		return fmt.Errorf("invalid SSID: %w", err)
+	}
+	quotedPassword, err := quoteWPAValue(password)
+	if err != nil {
+		return fmt.Errorf("invalid passphrase: %w", err)
+	}
+	confContent := fmt.Sprintf(`ctrl_interface=/run/nic/wpa_ctrl
 
 network={
     ssid=%s
@@ -125,13 +116,12 @@ network={
     ieee80211w=1
 }
 `, quotedSSID, quotedPassword)
-	}
 
 	if err := os.WriteFile(confFile, []byte(confContent), 0600); err != nil {
 		return fmt.Errorf("write wpa config: %w", err)
 	}
 
-	_, err := executor.Run("wpa_supplicant", "-B",
+	_, err = executor.Run("wpa_supplicant", "-B",
 		"-i", iface,
 		"-c", confFile,
 		"-P", filepath.Join(wpaConfDir, iface+".pid"),
@@ -209,29 +199,9 @@ func Disconnect(iface string) error {
 	}
 
 	var disconnectErrors []error
-	// Kill wpa_supplicant
-	pidFile := filepath.Join(wpaConfDir, iface+".pid")
-	if data, err := os.ReadFile(pidFile); err == nil {
-		pid, parseErr := strconv.Atoi(strings.TrimSpace(string(data)))
-		recordFile := filepath.Join(wpaConfDir, iface+".pid.json")
-		record, recordErr := control.ReadProcessRecord(recordFile)
-		if recordErr == nil && record.PID == pid {
-			if err := control.SignalProcessRecord(record, syscall.SIGTERM); err != nil && !errors.Is(err, control.ErrNotRunning) {
-				disconnectErrors = append(disconnectErrors, err)
-			}
-		} else if parseErr == nil && pid > 0 {
-			if name, nameErr := control.ProcessExecutableName(pid); nameErr == nil && name == "wpa_supplicant" {
-				if proc, findErr := os.FindProcess(pid); findErr == nil {
-					if err := proc.Signal(syscall.SIGTERM); err != nil && !errors.Is(err, os.ErrProcessDone) {
-						disconnectErrors = append(disconnectErrors, err)
-					}
-				}
-			}
-		}
-		_ = os.Remove(pidFile)
-		_ = os.Remove(recordFile)
+	if err := stopWPASupplicant(iface); err != nil {
+		disconnectErrors = append(disconnectErrors, err)
 	}
-	_ = os.Remove(filepath.Join(wpaConfDir, iface+".conf"))
 
 	recordPath := filepath.Join(wpaConfDir, iface+".iwd.json")
 	if data, err := os.ReadFile(recordPath); err == nil {
@@ -257,6 +227,79 @@ func Disconnect(iface string) error {
 	}
 
 	return errors.Join(disconnectErrors...)
+}
+
+// stopWPASupplicant keeps nic's PID and credential files until the tracked
+// supplicant has actually exited. Removing them immediately after SIGTERM lets
+// a subsequent connect start a second supplicant on the same interface.
+func stopWPASupplicant(iface string) error {
+	pidFile := filepath.Join(wpaConfDir, iface+".pid")
+	recordFile := filepath.Join(wpaConfDir, iface+".pid.json")
+
+	data, pidErr := os.ReadFile(pidFile)
+	if pidErr != nil && !os.IsNotExist(pidErr) {
+		return fmt.Errorf("read wpa_supplicant PID: %w", pidErr)
+	}
+	record, recordErr := control.ReadProcessRecord(recordFile)
+	if recordErr != nil && !os.IsNotExist(recordErr) {
+		return fmt.Errorf("read wpa_supplicant process record: %w", recordErr)
+	}
+
+	if recordErr == nil {
+		if pidErr == nil {
+			pid, err := strconv.Atoi(strings.TrimSpace(string(data)))
+			if err != nil || pid <= 0 {
+				return fmt.Errorf("invalid wpa_supplicant PID in %s", pidFile)
+			}
+			if pid != record.PID {
+				return fmt.Errorf("wpa_supplicant PID record mismatch for %s", iface)
+			}
+		}
+		// A PID record includes the process start time and is written immediately
+		// after launching the backend, so it is a stronger identity check than a
+		// basename alone (which wrappers may legitimately change).
+		if err := control.TerminateProcessRecord(record, syscall.SIGTERM, wpaStopTimeout); err != nil {
+			return err
+		}
+	} else if pidErr == nil {
+		pid, err := strconv.Atoi(strings.TrimSpace(string(data)))
+		if err != nil || pid <= 0 {
+			return fmt.Errorf("invalid wpa_supplicant PID in %s", pidFile)
+		}
+		name, err := control.ProcessExecutableName(pid)
+		if errors.Is(err, os.ErrNotExist) {
+			return removeWPAFiles(iface)
+		}
+		if err != nil {
+			return fmt.Errorf("inspect wpa_supplicant process %d: %w", pid, err)
+		}
+		if name != "wpa_supplicant" {
+			return fmt.Errorf("refusing to signal unrecognized process %d", pid)
+		}
+		record, err := control.RecordForPID(pid)
+		if err != nil {
+			return fmt.Errorf("record wpa_supplicant process %d: %w", pid, err)
+		}
+		if err := control.TerminateProcessRecord(record, syscall.SIGTERM, wpaStopTimeout); err != nil {
+			return err
+		}
+	}
+
+	return removeWPAFiles(iface)
+}
+
+func removeWPAFiles(iface string) error {
+	var removeErrors []error
+	for _, path := range []string{
+		filepath.Join(wpaConfDir, iface+".pid"),
+		filepath.Join(wpaConfDir, iface+".pid.json"),
+		filepath.Join(wpaConfDir, iface+".conf"),
+	} {
+		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+			removeErrors = append(removeErrors, err)
+		}
+	}
+	return errors.Join(removeErrors...)
 }
 
 // ManagedInterfaces returns interfaces for which nic has backend state.

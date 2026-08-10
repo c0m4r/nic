@@ -8,12 +8,15 @@ import (
 	"strconv"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/c0m4r/nic/internal/control"
 	"github.com/c0m4r/nic/internal/executor"
 )
 
 var externalClients = []string{"dhclient", "dhcpcd", "udhcpc"}
+
+const externalStopTimeout = 5 * time.Second
 
 type externalRecord struct {
 	Client  string             `json:"client"`
@@ -89,6 +92,9 @@ func startExternal(iface, client string) error {
 func stopExternal(iface string) error {
 	var managed externalRecord
 	recordErr := control.ReadJSON(externalRecordPath(iface), &managed)
+	if recordErr != nil && !os.IsNotExist(recordErr) {
+		return fmt.Errorf("read external DHCP record: %w", recordErr)
+	}
 	pidFile := filepath.Join(pidDir, iface+".ext.pid")
 	usedPIDFile := pidFile
 	data, err := os.ReadFile(pidFile)
@@ -103,47 +109,82 @@ func stopExternal(iface string) error {
 	}
 	if err != nil {
 		if recordErr == nil && managed.Process != nil {
-			signalErr := control.SignalProcessRecord(*managed.Process, syscall.SIGTERM)
-			if errors.Is(signalErr, control.ErrNotRunning) {
-				signalErr = nil
+			if err := stopTrackedExternal(managed); err != nil {
+				return err
 			}
 			_ = os.Remove(externalRecordPath(iface))
-			return signalErr
+			return nil
 		}
 		if recordErr == nil && managed.Client == "dhcpcd" && executor.CommandExists("dhcpcd") {
 			_, err = executor.Run("dhcpcd", "-k", iface)
-			_ = os.Remove(externalRecordPath(iface))
+			if err == nil {
+				_ = os.Remove(externalRecordPath(iface))
+			}
 			return err
+		}
+		if recordErr == nil && managed.Client != "" {
+			return fmt.Errorf("cannot verify external DHCP client %q on %s without a PID record", managed.Client, iface)
 		}
 		return nil
 	}
 
 	pid, err := strconv.Atoi(strings.TrimSpace(string(data)))
 	if err != nil {
-		return nil
+		return fmt.Errorf("invalid external DHCP PID in %s", usedPIDFile)
 	}
 
-	allowed := managed.Client
-	if allowed == "" {
-		allowed, _ = control.ProcessExecutableName(pid)
-		if !isExternalClient(allowed) {
-			return fmt.Errorf("refusing to signal unrecognized process %d from %s", pid, usedPIDFile)
-		}
+	if managed.Process != nil && managed.Process.PID != pid {
+		return fmt.Errorf("external DHCP PID record mismatch for %s", iface)
 	}
+
 	if managed.Process != nil && managed.Process.PID == pid {
-		if err := control.SignalProcessRecord(*managed.Process, syscall.SIGTERM); err != nil && !errors.Is(err, control.ErrNotRunning) {
+		if err := stopTrackedExternal(managed); err != nil {
 			return err
 		}
-	} else if name, nameErr := control.ProcessExecutableName(pid); nameErr == nil && name == allowed {
-		proc, findErr := os.FindProcess(pid)
-		if findErr == nil {
-			_ = proc.Signal(syscall.SIGTERM)
+	} else {
+		name, nameErr := control.ProcessExecutableName(pid)
+		if errors.Is(nameErr, os.ErrNotExist) {
+			_ = os.Remove(usedPIDFile)
+			_ = os.Remove(externalRecordPath(iface))
+			return nil
+		}
+		if nameErr != nil {
+			return fmt.Errorf("inspect external DHCP process %d: %w", pid, nameErr)
+		}
+		if !isExternalClient(name) || (managed.Client != "" && name != managed.Client) {
+			return fmt.Errorf("refusing to signal unrecognized process %d from %s", pid, usedPIDFile)
+		}
+		process, err := control.RecordForPID(pid)
+		if err != nil {
+			return fmt.Errorf("record external DHCP process %d: %w", pid, err)
+		}
+		if err := control.TerminateProcessRecord(process, syscall.SIGTERM, externalStopTimeout); err != nil {
+			return err
 		}
 	}
 	_ = os.Remove(usedPIDFile)
 	_ = os.Remove(externalRecordPath(iface))
 
 	return nil
+}
+
+func stopTrackedExternal(managed externalRecord) error {
+	if managed.Process == nil {
+		return nil
+	}
+	if managed.Client != "" && !isExternalClient(managed.Client) {
+		return fmt.Errorf("refusing to signal unrecognized external DHCP client %q", managed.Client)
+	}
+	if control.ProcessRecordIsLive(*managed.Process) {
+		name, err := control.ProcessExecutableName(managed.Process.PID)
+		if err != nil {
+			return fmt.Errorf("inspect external DHCP process %d: %w", managed.Process.PID, err)
+		}
+		if !isExternalClient(name) || (managed.Client != "" && name != managed.Client) {
+			return fmt.Errorf("refusing to signal unrecognized process %d", managed.Process.PID)
+		}
+	}
+	return control.TerminateProcessRecord(*managed.Process, syscall.SIGTERM, externalStopTimeout)
 }
 
 func stopAllExternal() error {

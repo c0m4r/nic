@@ -18,20 +18,9 @@ func applyLease(iface string, lease *Lease) error {
 func applyLeaseReplacing(iface string, lease, previous *Lease) error {
 	cidr := lease.CIDR()
 	applied := false
-	var dnsSnapshot dns.Snapshot
-	if len(lease.DNS) > 0 {
-		var err error
-		dnsSnapshot, err = dns.Capture()
-		if err != nil {
-			return fmt.Errorf("capture dns: %w", err)
-		}
-	}
 	defer func() {
 		if !applied {
 			rollbackLeaseTransition(iface, lease, previous)
-			if dnsSnapshot.Captured {
-				_ = dns.Restore(dnsSnapshot)
-			}
 		}
 	}()
 
@@ -58,12 +47,10 @@ func applyLeaseReplacing(iface string, lease, previous *Lease) error {
 		return err
 	}
 
-	// Write DNS
-	if len(lease.DNS) > 0 {
-		if err := dns.WriteResolvConf(lease.DNS); err != nil {
-			return fmt.Errorf("write dns: %w", err)
-		}
-		_ = dns.Guard()
+	// Replace only this client's DNS contribution. The shared resolver manager
+	// serializes concurrent DHCP renewals and retains static nameservers.
+	if err := dns.SetLeaseNameservers(dhcpV4DNSSource(iface), lease.DNS); err != nil {
+		return fmt.Errorf("write dns: %w", err)
 	}
 
 	applied = true
@@ -130,6 +117,7 @@ func unapplyLease(iface string, lease *Lease) {
 	if lease == nil {
 		return
 	}
+	_ = dns.RemoveLeaseNameservers(dhcpV4DNSSource(iface))
 	removeLeaseRoutes(iface, lease)
 	cidr := lease.CIDR()
 	_, _ = executor.RunIP("addr", "del", cidr, "dev", iface)
@@ -157,20 +145,9 @@ func applyLeaseV6(iface string, lease *LeaseV6) error {
 
 func applyLeaseV6Replacing(iface string, lease, previous *LeaseV6) error {
 	applied := false
-	var dnsSnapshot dns.Snapshot
-	if len(lease.DNS) > 0 {
-		var err error
-		dnsSnapshot, err = dns.Capture()
-		if err != nil {
-			return fmt.Errorf("capture dns: %w", err)
-		}
-	}
 	defer func() {
 		if !applied {
 			rollbackLeaseTransitionV6(iface, lease, previous)
-			if dnsSnapshot.Captured {
-				_ = dns.Restore(dnsSnapshot)
-			}
 		}
 	}()
 	for _, addr := range lease.Addresses {
@@ -186,26 +163,8 @@ func applyLeaseV6Replacing(iface string, lease, previous *LeaseV6) error {
 		}
 	}
 
-	if len(lease.DNS) > 0 {
-		// Merge with existing DNS rather than overwrite
-		existing := dns.CurrentNameservers()
-		merged := existing
-		for _, ns := range lease.DNS {
-			found := false
-			for _, e := range existing {
-				if e == ns {
-					found = true
-					break
-				}
-			}
-			if !found {
-				merged = append(merged, ns)
-			}
-		}
-		if err := dns.WriteResolvConf(merged); err != nil {
-			return fmt.Errorf("write v6 dns: %w", err)
-		}
-		_ = dns.Guard()
+	if err := dns.SetLeaseNameservers(dhcpV6DNSSource(iface), lease.DNS); err != nil {
+		return fmt.Errorf("write v6 dns: %w", err)
 	}
 
 	applied = true
@@ -234,11 +193,16 @@ func unapplyLeaseV6(iface string, lease *LeaseV6) {
 	if lease == nil {
 		return
 	}
+	_ = dns.RemoveLeaseNameservers(dhcpV6DNSSource(iface))
 	for _, addr := range lease.Addresses {
 		cidr := fmt.Sprintf("%s/%d", addr.IP, addr.PrefixLen)
 		_, _ = executor.RunIP("addr", "del", cidr, "dev", iface)
 	}
 }
+
+func dhcpV4DNSSource(iface string) string { return "dhcp4:" + iface }
+
+func dhcpV6DNSSource(iface string) string { return "dhcp6:" + iface }
 
 func cleanupSupersededLeaseV6(iface string, oldLease, newLease *LeaseV6) {
 	current := make(map[string]bool)

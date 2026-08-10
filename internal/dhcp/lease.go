@@ -78,6 +78,65 @@ func (l *Lease) ExpiryDeadline() time.Time {
 	return l.AcquiredAt.Add(time.Duration(l.LeaseTime) * time.Second)
 }
 
+// RenewalDeadline returns when the earliest DHCPv6 IA_NA should be renewed.
+func (l *LeaseV6) RenewalDeadline() time.Time {
+	preferred, ok := l.shortestPreferredLifetime()
+	if !ok {
+		return time.Time{}
+	}
+	t := l.RenewTime
+	if t == 0 {
+		t = preferred / 2
+	}
+	return l.AcquiredAt.Add(time.Duration(t) * time.Second)
+}
+
+// RebindDeadline returns when the earliest DHCPv6 IA_NA must be rebound.
+func (l *LeaseV6) RebindDeadline() time.Time {
+	preferred, ok := l.shortestPreferredLifetime()
+	if !ok {
+		return time.Time{}
+	}
+	t := l.RebindTime
+	if t == 0 {
+		t = preferred * 4 / 5
+	}
+	return l.AcquiredAt.Add(time.Duration(t) * time.Second)
+}
+
+// ExpiryDeadline returns when the first DHCPv6 address becomes invalid.
+func (l *LeaseV6) ExpiryDeadline() time.Time {
+	valid, ok := l.shortestValidLifetime()
+	if !ok {
+		return time.Time{}
+	}
+	return l.AcquiredAt.Add(time.Duration(valid) * time.Second)
+}
+
+func (l *LeaseV6) shortestValidLifetime() (uint32, bool) {
+	var shortest uint32
+	found := false
+	for _, addr := range l.Addresses {
+		if !found || addr.ValidLife < shortest {
+			shortest = addr.ValidLife
+			found = true
+		}
+	}
+	return shortest, found
+}
+
+func (l *LeaseV6) shortestPreferredLifetime() (uint32, bool) {
+	var shortest uint32
+	found := false
+	for _, addr := range l.Addresses {
+		if !found || addr.PreferredLife < shortest {
+			shortest = addr.PreferredLife
+			found = true
+		}
+	}
+	return shortest, found
+}
+
 func (l *Lease) save() error {
 	_ = os.MkdirAll(pidDir, 0755)
 	data, err := json.MarshalIndent(l, "", "  ")

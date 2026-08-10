@@ -26,6 +26,8 @@ const (
 	armFile      = "revert-armed"
 )
 
+var restoreSnapshotForWatcher = restoreSnapshot
+
 func stateFilePath() string {
 	return filepath.Join(runDir, stateFile)
 }
@@ -262,7 +264,12 @@ func WatchAndRevert(args []string) {
 				break
 			}
 			if !control.ProcessRecordIsLive(parent) {
-				break
+				if err := revertPendingState(statePath,
+					"applying process exited before configuration was armed; restoring previous network state..."); err != nil {
+					fmt.Fprintf(os.Stderr, "nic: revert failed: %v\n", err)
+					os.Exit(1)
+				}
+				return
 			}
 			time.Sleep(100 * time.Millisecond)
 		}
@@ -284,41 +291,45 @@ func WatchAndRevert(args []string) {
 		time.Sleep(500 * time.Millisecond)
 	}
 
-	// Serialize the deadline decision with Confirm. Once this lock is held,
-	// confirmation either already removed the pending state or is too late.
+	if err := revertPendingState(statePath, "revert timeout reached, restoring previous network state..."); err != nil {
+		fmt.Fprintf(os.Stderr, "nic: revert failed: %v\n", err)
+		os.Exit(1)
+	}
+}
+
+// revertPendingState serializes restoration with Confirm. Once its lock is
+// held, confirmation either already removed the pending state or is too late.
+func revertPendingState(statePath, message string) error {
 	lock, err := acquireLock(false)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "nic: lock revert: %v\n", err)
-		os.Exit(1)
+		return fmt.Errorf("lock revert: %w", err)
 	}
 	defer releaseLock(lock)
 	if _, err := os.Stat(statePath); os.IsNotExist(err) {
 		cleanupPendingFiles()
-		return
+		return nil
 	} else if err != nil {
-		fmt.Fprintf(os.Stderr, "nic: check pending revert: %v\n", err)
-		os.Exit(1)
+		return fmt.Errorf("check pending revert: %w", err)
 	}
 
-	// Check once more at the deadline so confirmation cannot be missed between
-	// the loop condition and restoration.
+	// Check once more while holding the lock so confirmation cannot be missed
+	// between the watcher loop and restoration.
 	if _, err := os.Stat(confirmFilePath()); err == nil {
 		cleanupPendingFiles()
-		return
+		return nil
+	} else if !os.IsNotExist(err) {
+		return fmt.Errorf("check confirmation: %w", err)
 	}
 
-	// Timeout reached — revert
-	fmt.Fprintln(os.Stderr, "nic: revert timeout reached, restoring previous network state...")
+	fmt.Fprintln(os.Stderr, "nic: "+message)
 
-	if err := restoreSnapshot(statePath); err != nil {
-		fmt.Fprintf(os.Stderr, "nic: revert failed: %v\n", err)
-		os.Exit(1)
+	if err := restoreSnapshotForWatcher(statePath); err != nil {
+		return err
 	}
 
-	// Clean up
 	cleanupPendingFiles()
-
 	fmt.Fprintln(os.Stderr, "nic: network state reverted successfully")
+	return nil
 }
 
 func cleanupPendingFiles() {

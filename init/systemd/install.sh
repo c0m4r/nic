@@ -15,6 +15,22 @@ if [ -z "$destdir" ] && [ "${NIC_DISABLE_SYSTEM_SERVICES:-0}" = 1 ]; then
         systemctl disable "$svc" 2>/dev/null || true
         systemctl mask "$svc" 2>/dev/null || true
     done
+
+    # systemd-resolved commonly owns /etc/resolv.conf through a symlink into
+    # /run. Once resolved is masked that target disappears, leaving DNS broken.
+    # Replace only those known runtime links; preserve administrator-managed
+    # files and symlinks (including the distribution-provided static fallback).
+    if [ -L /etc/resolv.conf ]; then
+        resolv_target=$(readlink /etc/resolv.conf 2>/dev/null || true)
+        case "$resolv_target" in
+            /run/systemd/resolve/*|../run/systemd/resolve/*)
+                tmp_resolv=$(mktemp /etc/.nic-resolv.XXXXXX)
+                printf '%s\n' '# Managed by nic; configure nameserver entries in /etc/nic.conf.' > "$tmp_resolv"
+                chmod 0644 "$tmp_resolv"
+                mv -f "$tmp_resolv" /etc/resolv.conf
+                ;;
+        esac
+    fi
 fi
 
 # Install service file

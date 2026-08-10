@@ -4,8 +4,10 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/c0m4r/nic/internal/control"
 )
@@ -93,5 +95,34 @@ func TestStopWatcherTerminatesOwnedProcess(t *testing.T) {
 	}
 	if control.ProcessRecordIsLive(record) {
 		t.Fatal("watcher process is still live")
+	}
+}
+
+func TestWatcherRestoresImmediatelyWhenParentDiesBeforeArming(t *testing.T) {
+	useTempRunDir(t)
+	if err := os.WriteFile(stateFilePath(), []byte("{}"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	called := false
+	original := restoreSnapshotForWatcher
+	restoreSnapshotForWatcher = func(path string) error {
+		if path != stateFilePath() {
+			t.Fatalf("restore path = %q, want %q", path, stateFilePath())
+		}
+		called = true
+		return nil
+	}
+	t.Cleanup(func() { restoreSnapshotForWatcher = original })
+
+	started := time.Now()
+	WatchAndRevert([]string{stateFilePath(), "60", strconv.Itoa(99999999), "not-a-live-start-time"})
+	if !called {
+		t.Fatal("watcher did not restore after its unarmed parent disappeared")
+	}
+	if elapsed := time.Since(started); elapsed >= time.Second {
+		t.Fatalf("unarmed parent restore took %s instead of running immediately", elapsed)
+	}
+	if IsPending() {
+		t.Fatal("pending revert state remained after restoration")
 	}
 }

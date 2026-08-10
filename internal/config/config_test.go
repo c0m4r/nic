@@ -83,6 +83,41 @@ func TestIncludeCycle(t *testing.T) {
 	}
 }
 
+func TestLoadCanonicalizesCommandFilesAndRelativeIncludes(t *testing.T) {
+	dir := t.TempDir()
+	mainPath := filepath.Join(dir, "nic.conf")
+	includePath := filepath.Join(dir, "included.conf")
+	if err := os.WriteFile(includePath, []byte("if eth0 up\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(mainPath, []byte("include included.conf\nroute default eth0\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	cwd, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	relative, err := filepath.Rel(cwd, mainPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(relative)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.Commands) != 2 {
+		t.Fatalf("commands = %d, want 2", len(cfg.Commands))
+	}
+	for _, cmd := range cfg.Commands {
+		if !filepath.IsAbs(cmd.File) {
+			t.Fatalf("command file is not canonical: %q", cmd.File)
+		}
+	}
+	if cfg.Commands[0].File != includePath || cfg.Commands[1].File != mainPath {
+		t.Fatalf("command files = [%s %s], want [%s %s]", cfg.Commands[0].File, cfg.Commands[1].File, includePath, mainPath)
+	}
+}
+
 func TestIsIPAddress(t *testing.T) {
 	tests := []struct {
 		input string

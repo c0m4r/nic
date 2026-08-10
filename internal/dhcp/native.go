@@ -3,6 +3,7 @@ package dhcp
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -10,15 +11,19 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/c0m4r/nic/internal/executor"
 )
 
 // nativeClient tracks a running native DHCP session for one interface.
 type nativeClient struct {
 	iface   string
+	v6      bool
 	cancel  context.CancelFunc
 	done    chan struct{}
 	lease   *Lease
 	leaseV6 *LeaseV6
+	retryAt time.Time
 	mu      sync.Mutex
 }
 
@@ -29,8 +34,11 @@ var (
 
 func startNative(iface string, daemonMode bool) error {
 	stopNativeKey(iface)
+	if err := ensureInterfaceUp(iface); err != nil {
+		return err
+	}
 
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(executor.CommandContext())
 	nc := &nativeClient{
 		iface:  iface,
 		cancel: cancel,
@@ -76,10 +84,14 @@ func startNative(iface string, daemonMode bool) error {
 func startNativeV6(iface string, daemonMode bool) error {
 	key := iface + ":6"
 	stopNativeKey(key)
+	if err := ensureInterfaceUp(iface); err != nil {
+		return err
+	}
 
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(executor.CommandContext())
 	nc := &nativeClient{
 		iface:  iface,
+		v6:     true,
 		cancel: cancel,
 		done:   make(chan struct{}),
 	}
@@ -140,6 +152,13 @@ func finishFailedStart(key string, nc *nativeClient) {
 	close(nc.done)
 }
 
+func ensureInterfaceUp(iface string) error {
+	if _, err := executor.RunIP("link", "set", iface, "up"); err != nil {
+		return fmt.Errorf("bring up %s before DHCP: %w", iface, err)
+	}
+	return nil
+}
+
 func (nc *nativeClient) renewLoop(ctx context.Context) {
 	defer close(nc.done)
 
@@ -147,95 +166,239 @@ func (nc *nativeClient) renewLoop(ctx context.Context) {
 		nc.mu.Lock()
 		lease := nc.lease
 		leaseV6 := nc.leaseV6
+		retryAt := nc.retryAt
 		nc.mu.Unlock()
 
-		// Pick the earliest renewal deadline
-		var nextRenew time.Time
-
-		if lease != nil {
-			t := lease.RenewalDeadline()
-			if nextRenew.IsZero() || t.Before(nextRenew) {
-				nextRenew = t
+		nextAction := retryAt
+		if nextAction.IsZero() {
+			if nc.v6 && leaseV6 != nil {
+				nextAction = leaseV6.RenewalDeadline()
+			} else if !nc.v6 && lease != nil {
+				nextAction = lease.RenewalDeadline()
 			}
 		}
-
-		if leaseV6 != nil && len(leaseV6.Addresses) > 0 {
-			renewAfter := leaseV6.RenewTime
-			if renewAfter == 0 {
-				renewAfter = leaseV6.Addresses[0].PreferredLife / 2
-			}
-			t := leaseV6.AcquiredAt.Add(time.Duration(renewAfter) * time.Second)
-			if nextRenew.IsZero() || t.Before(nextRenew) {
-				nextRenew = t
-			}
-		}
-
-		if nextRenew.IsZero() {
+		if nextAction.IsZero() {
 			return // no leases to renew
 		}
 
-		wait := time.Until(nextRenew)
-		if wait < time.Second {
-			wait = time.Second
+		wait := time.Until(nextAction)
+		if wait < 0 {
+			wait = 0
 		}
+		timer := time.NewTimer(wait)
 
 		select {
 		case <-ctx.Done():
+			timer.Stop()
 			nc.release()
 			return
-		case <-time.After(wait):
+		case <-timer.C:
 		}
 
-		// Renew DHCPv4
-		if lease != nil && time.Now().After(lease.RenewalDeadline()) {
-			newLease, err := renewLease(nc.iface, lease)
-			if err != nil {
-				fmt.Printf("dhcp: v4 renew failed: %v\n", err)
-				// Try rebind at T2
-				if time.Now().After(lease.RebindDeadline()) {
-					// Lease expiring, try full DORA
-					newLease, err = runDHCPv4(ctx, nc.iface)
-					if err != nil {
-						fmt.Printf("dhcp: v4 rebind failed: %v\n", err)
-						continue
-					}
-				} else {
-					continue
-				}
-			}
-			if err := applyLeaseReplacing(nc.iface, newLease, lease); err == nil {
-				cleanupSupersededLease(nc.iface, lease, newLease)
-				nc.mu.Lock()
-				nc.lease = newLease
-				nc.mu.Unlock()
-				_ = newLease.save()
-			}
-		}
-
-		// Renew DHCPv6
-		if leaseV6 != nil {
-			mac, _, err := getIfaceInfo(nc.iface)
-			if err == nil {
-				duid, duidErr := leaseDUID(leaseV6, mac)
-				if duidErr != nil {
-					fmt.Printf("dhcp: v6 client identity failed: %v\n", duidErr)
-					continue
-				}
-				newLease, err := renewLeaseV6(nc.iface, leaseV6, duid)
-				if err != nil {
-					fmt.Printf("dhcp: v6 renew failed: %v\n", err)
-					continue
-				}
-				if err := applyLeaseV6Replacing(nc.iface, newLease, leaseV6); err == nil {
-					cleanupSupersededLeaseV6(nc.iface, leaseV6, newLease)
-					nc.mu.Lock()
-					nc.leaseV6 = newLease
-					nc.mu.Unlock()
-					_ = newLease.save()
-				}
-			}
+		if nc.v6 {
+			nc.maintainV6(ctx, leaseV6)
+		} else {
+			nc.maintainV4(ctx, lease)
 		}
 	}
+}
+
+const (
+	leaseRecoveryRetry   = 5 * time.Second
+	leaseRecoveryTimeout = 30 * time.Second
+)
+
+func (nc *nativeClient) maintainV4(ctx context.Context, lease *Lease) {
+	if lease == nil {
+		nc.reacquireV4(ctx)
+		return
+	}
+
+	now := time.Now()
+	if !now.Before(lease.ExpiryDeadline()) {
+		nc.expireV4(lease)
+		nc.reacquireV4(ctx)
+		return
+	}
+	if now.Before(lease.RenewalDeadline()) {
+		return
+	}
+
+	var (
+		newLease *Lease
+		err      error
+	)
+	if !now.Before(lease.RebindDeadline()) {
+		rebindCtx, cancel := context.WithDeadline(ctx, lease.ExpiryDeadline())
+		newLease, err = rebindLease(rebindCtx, nc.iface, lease)
+		cancel()
+	} else {
+		newLease, err = renewLease(nc.iface, lease)
+	}
+	if err != nil {
+		fmt.Printf("dhcp: v4 renewal failed: %v\n", err)
+		if errors.Is(err, errDHCPv4NAK) {
+			nc.expireV4(lease)
+			nc.reacquireV4(ctx)
+			return
+		}
+		if !time.Now().Before(lease.ExpiryDeadline()) {
+			nc.expireV4(lease)
+			return
+		}
+		nc.scheduleRetry()
+		return
+	}
+
+	if err := applyLeaseReplacing(nc.iface, newLease, lease); err != nil {
+		fmt.Printf("dhcp: v4 apply renewal failed: %v\n", err)
+		nc.scheduleRetry()
+		return
+	}
+	cleanupSupersededLease(nc.iface, lease, newLease)
+	nc.mu.Lock()
+	nc.lease = newLease
+	nc.retryAt = time.Time{}
+	nc.mu.Unlock()
+	_ = newLease.save()
+}
+
+func (nc *nativeClient) reacquireV4(ctx context.Context) {
+	acquireCtx, cancel := context.WithTimeout(ctx, leaseRecoveryTimeout)
+	defer cancel()
+	lease, err := runDHCPv4(acquireCtx, nc.iface)
+	if err != nil {
+		if ctx.Err() == nil {
+			fmt.Printf("dhcp: v4 reacquire failed: %v\n", err)
+			nc.scheduleRetry()
+		}
+		return
+	}
+	if err := applyLease(nc.iface, lease); err != nil {
+		fmt.Printf("dhcp: v4 apply reacquired lease failed: %v\n", err)
+		nc.scheduleRetry()
+		return
+	}
+	nc.mu.Lock()
+	nc.lease = lease
+	nc.retryAt = time.Time{}
+	nc.mu.Unlock()
+	_ = lease.save()
+}
+
+func (nc *nativeClient) expireV4(lease *Lease) {
+	fmt.Printf("dhcp: v4 lease on %s expired; removing configuration\n", nc.iface)
+	unapplyLease(nc.iface, lease)
+	removeLease(nc.iface)
+	nc.mu.Lock()
+	if nc.lease == lease {
+		nc.lease = nil
+		nc.retryAt = time.Now()
+	}
+	nc.mu.Unlock()
+}
+
+func (nc *nativeClient) maintainV6(ctx context.Context, lease *LeaseV6) {
+	if lease == nil {
+		nc.reacquireV6(ctx)
+		return
+	}
+
+	now := time.Now()
+	if !now.Before(lease.ExpiryDeadline()) {
+		nc.expireV6(lease)
+		nc.reacquireV6(ctx)
+		return
+	}
+	if now.Before(lease.RenewalDeadline()) {
+		return
+	}
+
+	mac, _, err := getIfaceInfo(nc.iface)
+	if err != nil {
+		fmt.Printf("dhcp: v6 interface identity failed: %v\n", err)
+		nc.scheduleRetry()
+		return
+	}
+	duid, err := leaseDUID(lease, mac)
+	if err != nil {
+		fmt.Printf("dhcp: v6 client identity failed: %v\n", err)
+		nc.scheduleRetry()
+		return
+	}
+
+	var newLease *LeaseV6
+	if !now.Before(lease.RebindDeadline()) {
+		newLease, err = rebindLeaseV6(nc.iface, lease, duid)
+	} else {
+		newLease, err = renewLeaseV6(nc.iface, lease, duid)
+	}
+	if err != nil {
+		fmt.Printf("dhcp: v6 renewal failed: %v\n", err)
+		if errors.Is(err, errDHCPv6NoAddresses) {
+			nc.expireV6(lease)
+			nc.reacquireV6(ctx)
+			return
+		}
+		if !time.Now().Before(lease.ExpiryDeadline()) {
+			nc.expireV6(lease)
+			return
+		}
+		nc.scheduleRetry()
+		return
+	}
+	if err := applyLeaseV6Replacing(nc.iface, newLease, lease); err != nil {
+		fmt.Printf("dhcp: v6 apply renewal failed: %v\n", err)
+		nc.scheduleRetry()
+		return
+	}
+	cleanupSupersededLeaseV6(nc.iface, lease, newLease)
+	nc.mu.Lock()
+	nc.leaseV6 = newLease
+	nc.retryAt = time.Time{}
+	nc.mu.Unlock()
+	_ = newLease.save()
+}
+
+func (nc *nativeClient) reacquireV6(ctx context.Context) {
+	acquireCtx, cancel := context.WithTimeout(ctx, leaseRecoveryTimeout)
+	defer cancel()
+	lease, err := runDHCPv6(acquireCtx, nc.iface)
+	if err != nil {
+		if ctx.Err() == nil {
+			fmt.Printf("dhcp: v6 reacquire failed: %v\n", err)
+			nc.scheduleRetry()
+		}
+		return
+	}
+	if err := applyLeaseV6(nc.iface, lease); err != nil {
+		fmt.Printf("dhcp: v6 apply reacquired lease failed: %v\n", err)
+		nc.scheduleRetry()
+		return
+	}
+	nc.mu.Lock()
+	nc.leaseV6 = lease
+	nc.retryAt = time.Time{}
+	nc.mu.Unlock()
+	_ = lease.save()
+}
+
+func (nc *nativeClient) expireV6(lease *LeaseV6) {
+	fmt.Printf("dhcp: v6 lease on %s expired; removing configuration\n", nc.iface)
+	unapplyLeaseV6(nc.iface, lease)
+	removeLeaseV6(nc.iface)
+	nc.mu.Lock()
+	if nc.leaseV6 == lease {
+		nc.leaseV6 = nil
+		nc.retryAt = time.Now()
+	}
+	nc.mu.Unlock()
+}
+
+func (nc *nativeClient) scheduleRetry() {
+	nc.mu.Lock()
+	nc.retryAt = time.Now().Add(leaseRecoveryRetry)
+	nc.mu.Unlock()
 }
 
 func (nc *nativeClient) release() {
@@ -248,11 +411,10 @@ func (nc *nativeClient) release() {
 	if lease != nil {
 		mac, _, err := getIfaceInfo(nc.iface)
 		if err == nil {
-			serverIP := net.ParseIP(lease.ServerIP)
-			clientIP := net.ParseIP(lease.IP)
-			if serverIP != nil && clientIP != nil {
-				release := buildRelease(mac, clientIP, serverIP)
-				conn, err := net.DialTimeout("udp4", lease.ServerIP+":67", 2*time.Second)
+			localAddr, serverAddr, addrErr := v4LeaseUDPAddrs(lease)
+			if addrErr == nil {
+				release := buildRelease(mac, localAddr.IP, serverAddr.IP)
+				conn, err := net.DialUDP("udp4", localAddr, serverAddr)
 				if err == nil {
 					_, _ = conn.Write(release)
 					_ = conn.Close()
