@@ -1,6 +1,6 @@
 .PHONY: fmt lint test build install clean install-systemd install-openrc install-sysv install-runit
 
-VERSION := 0.1.3
+VERSION := 0.1.4
 LDFLAGS := -ldflags "-s -w -X main.version=$(VERSION)"
 PREFIX      ?= /usr/local
 SYSCONFDIR  ?= /etc
