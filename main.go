@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"context"
+	_ "embed"
 	"errors"
 	"fmt"
 	"net"
@@ -26,7 +27,10 @@ import (
 	"github.com/c0m4r/nic/internal/wifi"
 )
 
-var version = "0.1.4"
+//go:embed VERSION
+var versionFile string
+
+var version = strings.TrimSpace(versionFile)
 
 const defaultConfig = "/etc/nic.conf"
 

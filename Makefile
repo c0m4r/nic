@@ -1,13 +1,16 @@
-.PHONY: fmt lint test build install clean install-systemd install-openrc install-sysv install-runit
+.PHONY: fmt lint test build install clean version install-systemd install-openrc install-sysv install-runit
 
-VERSION := 0.1.4
-LDFLAGS := -ldflags "-s -w -X main.version=$(VERSION)"
+VERSION := $(shell cat VERSION)
+LDFLAGS := -ldflags "-s -w"
 PREFIX      ?= /usr/local
 SYSCONFDIR  ?= /etc
 INITDIR     ?= /etc/init.d
 SYSTEMDDIR  ?= /etc/systemd/system
 RUNITDIR    ?= /etc/sv
 RUNITACTIVE ?= /var/service
+
+version:
+	@echo $(VERSION)
 
 fmt:
 	go fmt ./...

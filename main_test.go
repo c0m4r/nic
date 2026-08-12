@@ -19,6 +19,15 @@ import (
 	"github.com/c0m4r/nic/internal/state"
 )
 
+func TestVersionEmbed(t *testing.T) {
+	if version == "" {
+		t.Fatal("version is empty, VERSION file missing or blank")
+	}
+	if strings.ContainsAny(version, " \t\n\r") {
+		t.Errorf("version = %q, want no whitespace", version)
+	}
+}
+
 func TestReverseIPCommand(t *testing.T) {
 	tests := []struct {
 		name string
