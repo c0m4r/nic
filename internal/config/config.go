@@ -20,8 +20,8 @@ const (
 	CmdInclude                      // include <glob>
 	CmdNameserver                   // nameserver <ip> / ns <ip>
 	CmdWifi                         // wifi <ssid> <password> [iface]
-	CmdDHCP                         // dhcp <iface> [client]
-	CmdDHCPv6                       // dhcpv6 <iface> [required]
+	CmdDHCP                         // dhcp|dhcp4|dhcpv4 <iface> [client]
+	CmdDHCPv6                       // dhcpv6|dhcp6 <iface> [required]
 	CmdIfShortcut                   // if <iface> up/down  OR  up/down <iface>
 	CmdIPShortcut                   // ip <addr>[/prefix] <iface>
 	CmdRouteShortcut                // route <dest> [via <gw>] <iface>
@@ -258,9 +258,9 @@ func parseLine(line, file string, lineNum int) (Command, error) {
 		cmd.Type = CmdWifi
 		return cmd, nil
 
-	case "dhcp":
+	case "dhcp", "dhcp4", "dhcpv4":
 		if len(tokens) < 2 || len(tokens) > 3 {
-			return cmd, fmt.Errorf("dhcp requires an interface: dhcp <iface> [client]")
+			return cmd, fmt.Errorf("%s requires an interface: %s <iface> [client]", tokens[0], tokens[0])
 		}
 		if err := validateInterfaceReference(tokens[1]); err != nil {
 			return cmd, fmt.Errorf("invalid DHCP interface: %w", err)
@@ -269,19 +269,23 @@ func parseLine(line, file string, lineNum int) (Command, error) {
 			tokens[2] != "dhcpcd" && tokens[2] != "udhcpc" {
 			return cmd, fmt.Errorf("unsupported DHCP client %q", tokens[2])
 		}
+		// Normalize: dhcp4 eth0 → dhcp eth0, so spellings compare equal.
+		cmd.Tokens = append([]string{"dhcp"}, tokens[1:]...)
 		cmd.Type = CmdDHCP
 		return cmd, nil
 
-	case "dhcpv6":
+	case "dhcpv6", "dhcp6":
 		if len(tokens) < 2 || len(tokens) > 3 {
-			return cmd, fmt.Errorf("dhcpv6 requires an interface: dhcpv6 <iface> [required]")
+			return cmd, fmt.Errorf("%s requires an interface: %s <iface> [required]", tokens[0], tokens[0])
 		}
 		if err := validateInterfaceReference(tokens[1]); err != nil {
 			return cmd, fmt.Errorf("invalid DHCPv6 interface: %w", err)
 		}
 		if len(tokens) == 3 && tokens[2] != "required" {
-			return cmd, fmt.Errorf("unsupported dhcpv6 option %q (use required)", tokens[2])
+			return cmd, fmt.Errorf("unsupported %s option %q (use required)", tokens[0], tokens[2])
 		}
+		// Normalize: dhcp6 eth0 → dhcpv6 eth0, so spellings compare equal.
+		cmd.Tokens = append([]string{"dhcpv6"}, tokens[1:]...)
 		cmd.Type = CmdDHCPv6
 		return cmd, nil
 

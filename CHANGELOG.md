@@ -12,6 +12,7 @@ Types of changes: Added, Changed, Deprecated, Removed, Fixed, Security
 ### Added
 
 - Added the `dhcpv6 <iface> required` modifier, which restores the previous behavior of treating any DHCPv6 failure as fatal to the whole configuration.
+- Added `dhcp4` and `dhcpv4` as aliases for `dhcp`, and `dhcp6` as an alias for `dhcpv6`. Spellings are normalized when parsed, so switching between them is not reported as a configuration change.
 
 ### Changed
 

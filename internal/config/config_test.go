@@ -56,7 +56,10 @@ func TestValidationRejectsInvalidValues(t *testing.T) {
 		"route default via not-an-ip eth0",
 		"route default via 192.0.2.1 eth0 extra",
 		"dhcp ../../tmp/escape",
+		"dhcp4 ../escape",
+		"dhcpv4 ../escape",
 		"dhcpv6 ../escape",
+		"dhcp6 ../escape",
 		"wifi ssid password ../../tmp/escape",
 		"ip 192.0.2.1/24 ../escape",
 		"route default ../escape",
@@ -212,8 +215,13 @@ func TestParseLine(t *testing.T) {
 		{"wifi MySSID MyPassword wlan0", CmdWifi, false},
 		{"dhcp eth0", CmdDHCP, false},
 		{"dhcp eth0 dhclient", CmdDHCP, false},
+		{"dhcp4 eth0", CmdDHCP, false},
+		{"dhcpv4 eth0", CmdDHCP, false},
+		{"dhcpv4 eth0 udhcpc", CmdDHCP, false},
 		{"dhcpv6 eth0", CmdDHCPv6, false},
 		{"dhcpv6 eth0 required", CmdDHCPv6, false},
+		{"dhcp6 eth0", CmdDHCPv6, false},
+		{"dhcp6 eth0 required", CmdDHCPv6, false},
 		{"include /etc/nic.d/*.conf", CmdInclude, false},
 
 		// Errors
@@ -226,8 +234,12 @@ func TestParseLine(t *testing.T) {
 		{"wifi x", CmdWifi, true},
 		{"dhcp", CmdDHCP, true},
 		{"dhcpv6", CmdDHCPv6, true},
+		{"dhcp6", CmdDHCPv6, true},
+		{"dhcpv4", CmdDHCP, true},
 		{"dhcpv6 eth0 optional", CmdDHCPv6, true},
+		{"dhcp6 eth0 optional", CmdDHCPv6, true},
 		{"dhcpv6 eth0 required extra", CmdDHCPv6, true},
+		{"dhcp4 eth0 mystery-client", CmdDHCP, true},
 		{"include", CmdInclude, true},
 		{"bogus command", CmdIPRoute2, true},
 	}
@@ -522,6 +534,8 @@ func TestDHCPv6Required(t *testing.T) {
 	}{
 		{"dhcpv6 eth0", false},
 		{"dhcpv6 eth0 required", true},
+		{"dhcp6 eth0", false},
+		{"dhcp6 eth0 required", true},
 		{"dhcp eth0", false},
 	}
 	for _, tt := range tests {
@@ -531,6 +545,33 @@ func TestDHCPv6Required(t *testing.T) {
 		}
 		if got := DHCPv6Required(cmd); got != tt.want {
 			t.Errorf("DHCPv6Required(%q) = %v, want %v", tt.line, got, tt.want)
+		}
+	}
+}
+
+func TestDHCPAliasNormalization(t *testing.T) {
+	tests := []struct {
+		line string
+		want []string
+	}{
+		{"dhcp eth0", []string{"dhcp", "eth0"}},
+		{"dhcp4 eth0", []string{"dhcp", "eth0"}},
+		{"dhcpv4 eth0", []string{"dhcp", "eth0"}},
+		{"dhcpv4 eth0 dhclient", []string{"dhcp", "eth0", "dhclient"}},
+		{"dhcpv6 eth0", []string{"dhcpv6", "eth0"}},
+		{"dhcp6 eth0", []string{"dhcpv6", "eth0"}},
+		{"dhcp6 eth0 required", []string{"dhcpv6", "eth0", "required"}},
+	}
+	for _, tt := range tests {
+		cmd, err := parseLine(tt.line, "test.conf", 1)
+		if err != nil {
+			t.Fatalf("parseLine(%q): %v", tt.line, err)
+		}
+		if !reflect.DeepEqual(cmd.Tokens, tt.want) {
+			t.Errorf("parseLine(%q).Tokens = %v, want %v", tt.line, cmd.Tokens, tt.want)
+		}
+		if cmd.Raw != tt.line {
+			t.Errorf("parseLine(%q).Raw = %q, want the original spelling", tt.line, cmd.Raw)
 		}
 	}
 }

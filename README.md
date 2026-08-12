@@ -137,6 +137,9 @@ dhcpv6 eth0            # best-effort DHCPv6
 dhcpv6 eth0 required   # abort the whole configuration if DHCPv6 fails
 ```
 
+`dhcp4` and `dhcpv4` are accepted as aliases for `dhcp`, and `dhcp6` for
+`dhcpv6`.
+
 Supports dhclient, dhcpcd, and udhcpc.
 
 The native client is tried first. If it cannot obtain a lease, nic falls back
