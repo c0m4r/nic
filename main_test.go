@@ -444,6 +444,57 @@ func TestDaemonStartupTerminationCancelsRunningCommand(t *testing.T) {
 	}
 }
 
+func TestResolveOptionalDHCPv6(t *testing.T) {
+	tests := []struct {
+		name      string
+		addrJSON  string
+		wantFatal bool
+	}{{
+		name:     "another address family configured the interface",
+		addrJSON: `[{"ifname":"eth0","addr_info":[{"family":"inet","local":"10.0.2.15","prefixlen":24,"scope":"global"}]}]`,
+	}, {
+		name:      "only a link-local address remains",
+		addrJSON:  `[{"ifname":"eth0","addr_info":[{"family":"inet6","local":"fe80::1","prefixlen":64,"scope":"link"}]}]`,
+		wantFatal: true,
+	}, {
+		name:      "interface has no address at all",
+		addrJSON:  `[{"ifname":"eth0","addr_info":[]}]`,
+		wantFatal: true,
+	}}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := t.TempDir()
+			script := "#!/bin/sh\necho '" + tt.addrJSON + "'\n"
+			if err := os.WriteFile(filepath.Join(dir, "ip"), []byte(script), 0755); err != nil {
+				t.Fatal(err)
+			}
+			t.Setenv("PATH", dir)
+			oldDryRun := executor.DryRun
+			executor.DryRun = false
+			t.Cleanup(func() { executor.DryRun = oldDryRun })
+
+			failures := []optionalDHCPv6Failure{{
+				iface: "eth0",
+				err:   errors.New("nic.conf:3: dhcp v6: no DHCPv6 advertise received"),
+			}}
+			err := resolveOptionalDHCPv6(failures)
+			if !tt.wantFatal {
+				if err != nil {
+					t.Fatalf("resolveOptionalDHCPv6 = %v, want nil", err)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatal("resolveOptionalDHCPv6 = nil, want error")
+			}
+			if !strings.Contains(err.Error(), "no DHCPv6 advertise received") {
+				t.Fatalf("error dropped the original cause: %v", err)
+			}
+		})
+	}
+}
+
 func setupFakeRuntime(t *testing.T) (string, string) {
 	t.Helper()
 	runtimeDir := t.TempDir()

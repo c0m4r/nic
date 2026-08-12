@@ -212,6 +212,8 @@ func TestParseLine(t *testing.T) {
 		{"wifi MySSID MyPassword wlan0", CmdWifi, false},
 		{"dhcp eth0", CmdDHCP, false},
 		{"dhcp eth0 dhclient", CmdDHCP, false},
+		{"dhcpv6 eth0", CmdDHCPv6, false},
+		{"dhcpv6 eth0 required", CmdDHCPv6, false},
 		{"include /etc/nic.d/*.conf", CmdInclude, false},
 
 		// Errors
@@ -223,6 +225,9 @@ func TestParseLine(t *testing.T) {
 		{"ns", CmdNameserver, true},
 		{"wifi x", CmdWifi, true},
 		{"dhcp", CmdDHCP, true},
+		{"dhcpv6", CmdDHCPv6, true},
+		{"dhcpv6 eth0 optional", CmdDHCPv6, true},
+		{"dhcpv6 eth0 required extra", CmdDHCPv6, true},
 		{"include", CmdInclude, true},
 		{"bogus command", CmdIPRoute2, true},
 	}
@@ -506,6 +511,26 @@ func TestNaturalLess(t *testing.T) {
 		got := naturalLess(tt.a, tt.b)
 		if got != tt.want {
 			t.Errorf("naturalLess(%q, %q) = %v, want %v", tt.a, tt.b, got, tt.want)
+		}
+	}
+}
+
+func TestDHCPv6Required(t *testing.T) {
+	tests := []struct {
+		line string
+		want bool
+	}{
+		{"dhcpv6 eth0", false},
+		{"dhcpv6 eth0 required", true},
+		{"dhcp eth0", false},
+	}
+	for _, tt := range tests {
+		cmd, err := parseLine(tt.line, "test.conf", 1)
+		if err != nil {
+			t.Fatalf("parseLine(%q): %v", tt.line, err)
+		}
+		if got := DHCPv6Required(cmd); got != tt.want {
+			t.Errorf("DHCPv6Required(%q) = %v, want %v", tt.line, got, tt.want)
 		}
 	}
 }

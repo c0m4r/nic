@@ -21,7 +21,7 @@ const (
 	CmdNameserver                   // nameserver <ip> / ns <ip>
 	CmdWifi                         // wifi <ssid> <password> [iface]
 	CmdDHCP                         // dhcp <iface> [client]
-	CmdDHCPv6                       // dhcpv6 <iface>
+	CmdDHCPv6                       // dhcpv6 <iface> [required]
 	CmdIfShortcut                   // if <iface> up/down  OR  up/down <iface>
 	CmdIPShortcut                   // ip <addr>[/prefix] <iface>
 	CmdRouteShortcut                // route <dest> [via <gw>] <iface>
@@ -273,11 +273,14 @@ func parseLine(line, file string, lineNum int) (Command, error) {
 		return cmd, nil
 
 	case "dhcpv6":
-		if len(tokens) != 2 {
-			return cmd, fmt.Errorf("dhcpv6 requires an interface: dhcpv6 <iface>")
+		if len(tokens) < 2 || len(tokens) > 3 {
+			return cmd, fmt.Errorf("dhcpv6 requires an interface: dhcpv6 <iface> [required]")
 		}
 		if err := validateInterfaceReference(tokens[1]); err != nil {
 			return cmd, fmt.Errorf("invalid DHCPv6 interface: %w", err)
+		}
+		if len(tokens) == 3 && tokens[2] != "required" {
+			return cmd, fmt.Errorf("unsupported dhcpv6 option %q (use required)", tokens[2])
 		}
 		cmd.Type = CmdDHCPv6
 		return cmd, nil
@@ -421,6 +424,13 @@ func ExpandCommand(cmd Command) []string {
 	}
 }
 
+// DHCPv6Required reports whether a dhcpv6 command was marked `required`, making
+// a failed lease fatal to the whole configuration. Without it, DHCPv6 is
+// best-effort: the interface may still come up on another address family.
+func DHCPv6Required(cmd Command) bool {
+	return cmd.Type == CmdDHCPv6 && len(cmd.Tokens) >= 3 && cmd.Tokens[2] == "required"
+}
+
 // ExpandCommandString returns a human-readable form of the command.
 func ExpandCommandString(cmd Command) string {
 	switch cmd.Type {
@@ -455,6 +465,9 @@ func ExpandCommandString(cmd Command) string {
 		}
 		return fmt.Sprintf("dhcp %s%s", iface, client)
 	case CmdDHCPv6:
+		if DHCPv6Required(cmd) {
+			return fmt.Sprintf("dhcpv6 %s (required)", cmd.Tokens[1])
+		}
 		return fmt.Sprintf("dhcpv6 %s", cmd.Tokens[1])
 	default:
 		return cmd.Raw

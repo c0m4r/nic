@@ -290,6 +290,7 @@ func applyConfig(cfg *config.Config, daemonMode bool) error {
 	}
 	mgr := alias.NewManager()
 	var nameservers []string
+	var optionalV6Failures []optionalDHCPv6Failure
 
 	// First pass: collect aliases, pins, and static resolver inputs. Resolver
 	// policy must be in place before DHCP sessions start so later renewals cannot
@@ -358,7 +359,15 @@ func applyConfig(cfg *config.Config, daemonMode bool) error {
 				iface = resolved
 			}
 			if err := dhcp.StartV6(iface, daemonMode); err != nil {
-				return fmt.Errorf("%s:%d: %w", cmd.File, cmd.LineNum, err)
+				wrapped := fmt.Errorf("%s:%d: %w", cmd.File, cmd.LineNum, err)
+				if config.DHCPv6Required(cmd) {
+					return wrapped
+				}
+				// Severity depends on whether the interface ends up configured
+				// by another address family, which is only known once the rest
+				// of the configuration has been applied.
+				optionalV6Failures = append(optionalV6Failures,
+					optionalDHCPv6Failure{iface: iface, err: wrapped})
 			}
 
 		case config.CmdIPRoute2, config.CmdIfShortcut, config.CmdIPShortcut, config.CmdRouteShortcut:
@@ -386,7 +395,40 @@ func applyConfig(cfg *config.Config, daemonMode bool) error {
 	// Wait for IPv6 DAD (duplicate address detection) to complete
 	waitForDAD()
 
-	return nil
+	// Resolved only after DAD so an address that is merely still tentative is
+	// not mistaken for an unconfigured interface.
+	return resolveOptionalDHCPv6(optionalV6Failures)
+}
+
+// optionalDHCPv6Failure records a DHCPv6 lease failure whose severity is not
+// yet known, because it depends on how the rest of the interface configures.
+type optionalDHCPv6Failure struct {
+	iface string
+	err   error
+}
+
+// resolveOptionalDHCPv6 downgrades DHCPv6 failures to warnings on interfaces
+// that obtained an address some other way. This mirrors NetworkManager's
+// may-fail model, where one address family may fail as long as the interface
+// still ends up configured; an interface left with no address at all keeps the
+// error. Mark the command `dhcpv6 <iface> required` to always fail instead.
+func resolveOptionalDHCPv6(failures []optionalDHCPv6Failure) error {
+	var fatal []error
+	for _, failure := range failures {
+		configured, err := state.HasGlobalAddress(failure.iface)
+		if err != nil {
+			fatal = append(fatal, errors.Join(failure.err, err))
+			continue
+		}
+		if !configured {
+			fatal = append(fatal, fmt.Errorf("%w (%s has no address from any other source)",
+				failure.err, failure.iface))
+			continue
+		}
+		fmt.Fprintf(os.Stderr, "warning: %v (continuing, %s is configured without DHCPv6)\n",
+			failure.err, failure.iface)
+	}
+	return errors.Join(fatal...)
 }
 
 func validateWifiConfigPermissions(cfg *config.Config) error {

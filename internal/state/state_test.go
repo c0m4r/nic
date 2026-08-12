@@ -240,6 +240,58 @@ exit 0
 	}
 }
 
+func TestHasGlobalAddress(t *testing.T) {
+	tests := []struct {
+		name   string
+		output string
+		want   bool
+	}{{
+		name:   "global scope counts",
+		output: `[{"ifname":"eth0","addr_info":[{"family":"inet","local":"10.0.2.15","scope":"global"}]}]`,
+		want:   true,
+	}, {
+		name:   "universe scope counts",
+		output: `[{"ifname":"eth0","addr_info":[{"family":"inet6","local":"2001:db8::1","scope":"universe"}]}]`,
+		want:   true,
+	}, {
+		name:   "link-local does not count",
+		output: `[{"ifname":"eth0","addr_info":[{"family":"inet6","local":"fe80::1","scope":"link"}]}]`,
+	}, {
+		name:   "host scope does not count",
+		output: `[{"ifname":"lo","addr_info":[{"family":"inet","local":"127.0.0.1","scope":"host"}]}]`,
+	}, {
+		name:   "tentative address does not count",
+		output: `[{"ifname":"eth0","addr_info":[{"family":"inet6","local":"2001:db8::1","scope":"global","tentative":true}]}]`,
+	}, {
+		name:   "no addresses",
+		output: `[{"ifname":"eth0","addr_info":[]}]`,
+	}}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := t.TempDir()
+			writeFakeIP(t, dir, "#!/bin/sh\necho '"+tt.output+"'\n")
+			t.Setenv("PATH", dir)
+			got, err := HasGlobalAddress("eth0")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got != tt.want {
+				t.Fatalf("HasGlobalAddress = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestHasGlobalAddressPropagatesFailure(t *testing.T) {
+	dir := t.TempDir()
+	writeFakeIP(t, dir, "#!/bin/sh\necho no-such-device >&2\nexit 1\n")
+	t.Setenv("PATH", dir)
+	if _, err := HasGlobalAddress("eth0"); err == nil || !strings.Contains(err.Error(), "no-such-device") {
+		t.Fatalf("HasGlobalAddress error = %v", err)
+	}
+}
+
 func writeFakeIP(t *testing.T, dir, content string) {
 	t.Helper()
 	if err := os.WriteFile(filepath.Join(dir, "ip"), []byte(content), 0755); err != nil {

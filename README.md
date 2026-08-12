@@ -133,6 +133,8 @@ static entries, DNS from active DHCP sessions is merged deterministically.
 ```sh
 dhcp eth0              # auto-detects client
 dhcp eth0 dhclient     # force specific client
+dhcpv6 eth0            # best-effort DHCPv6
+dhcpv6 eth0 required   # abort the whole configuration if DHCPv6 fails
 ```
 
 Supports dhclient, dhcpcd, and udhcpc.
@@ -140,6 +142,12 @@ Supports dhclient, dhcpcd, and udhcpc.
 The native client is tried first. If it cannot obtain a lease, nic falls back
 to the first installed external client. Specify `native`, `dhclient`,
 `dhcpcd`, or `udhcpc` to force one implementation.
+
+`dhcpv6` is best-effort: if no lease is obtained but the interface is
+configured by another address family (a DHCPv4 lease or a static address), nic
+logs a warning and continues. The configuration fails only when the interface
+is left with no address at all. Add `required` to treat any DHCPv6 failure as
+fatal, which is the equivalent of NetworkManager's `ipv6.may-fail=no`.
 
 ### WiFi
 

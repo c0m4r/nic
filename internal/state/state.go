@@ -136,6 +136,34 @@ func GetRoutes6() ([]Route, error) {
 	return routes, nil
 }
 
+// HasGlobalAddress reports whether an interface currently holds at least one
+// usable address of any family. Link-local, host, and still-tentative addresses
+// do not count, so this answers "did any address family configure this link".
+func HasGlobalAddress(iface string) (bool, error) {
+	output, err := executor.RunQuiet("ip", "-j", "addr", "show", "dev", iface)
+	if err != nil {
+		return false, err
+	}
+	if output == "" {
+		return false, nil
+	}
+	var entries []AddrEntry
+	if err := json.Unmarshal([]byte(output), &entries); err != nil {
+		return false, fmt.Errorf("parse addresses on %s: %w", iface, err)
+	}
+	for _, entry := range entries {
+		for _, addr := range entry.AddrInfo {
+			if addr.Tentative {
+				continue
+			}
+			if addr.Scope == "global" || addr.Scope == "universe" {
+				return true, nil
+			}
+		}
+	}
+	return false, nil
+}
+
 // Capture takes a full snapshot of current network state.
 func Capture() (*NetworkState, error) {
 	capturedAt := time.Now()

@@ -9,6 +9,14 @@ Types of changes: Added, Changed, Deprecated, Removed, Fixed, Security
 
 ## [Unreleased]
 
+### Added
+
+- Added the `dhcpv6 <iface> required` modifier, which restores the previous behavior of treating any DHCPv6 failure as fatal to the whole configuration.
+
+### Changed
+
+- `dhcpv6` is now best-effort, following NetworkManager's `may-fail` model. A failed DHCPv6 lease is a warning when the interface is configured by another address family, and remains an error only when the interface is left with no address at all. Previously a single unreachable DHCPv6 server rolled back every interface on the host.
+
 ### Fixed
 
 - Fixed baseline restore failing on hosts with a tunnel device such as `sit0`, which rejects every link-layer address change. Link addresses and MTUs are now only rewritten when they differ from the live value, so `start`, `stop`, and `restart` no longer abort before configuring anything.
