@@ -246,22 +246,37 @@ func RestoreState(path string) error {
 	_, err = executor.RunIP("-6", "route", "flush", "table", "all")
 	addError("flush all IPv6 routes", err)
 
+	// Read live link properties so they are only rewritten where they actually
+	// drifted. Tunnel devices such as sit0 reject every link-layer address
+	// change with EOPNOTSUPP, which would otherwise fail each restore on any
+	// machine that has one even though nic never touched the link. An interface
+	// missing here keeps the zero value, so the restore is still attempted; a
+	// failed read is not itself a restore failure, since each command below
+	// still reports its own error.
+	live, _ := GetInterfaces()
+	liveByName := make(map[string]Interface, len(live))
+	for _, iface := range live {
+		liveByName[iface.IfName] = iface
+	}
+
 	// Bring links down before restoring mutable link properties, then flush all
 	// addresses on non-loopback interfaces.
 	for _, iface := range st.Interfaces {
 		if iface.IfName == "lo" {
 			continue
 		}
+		current := liveByName[iface.IfName]
 		_, _ = executor.RunIP("link", "set", "dev", iface.IfName, "nomaster")
 		_, err := executor.RunIP("link", "set", "dev", iface.IfName, "down")
 		addError("bring down "+iface.IfName, err)
 		_, err = executor.RunIP("addr", "flush", "dev", iface.IfName)
 		addError("flush addresses on "+iface.IfName, err)
-		if iface.Address != "" && iface.Address != "00:00:00:00:00:00" {
+		if iface.Address != "" && iface.Address != "00:00:00:00:00:00" &&
+			!strings.EqualFold(current.Address, iface.Address) {
 			_, err = executor.RunIP("link", "set", "dev", iface.IfName, "address", iface.Address)
 			addError("restore address on "+iface.IfName, err)
 		}
-		if iface.MTU > 0 {
+		if iface.MTU > 0 && current.MTU != iface.MTU {
 			_, err = executor.RunIP("link", "set", "dev", iface.IfName, "mtu", fmt.Sprintf("%d", iface.MTU))
 			addError("restore MTU on "+iface.IfName, err)
 		}

@@ -3,14 +3,25 @@ package dhcp
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"math/rand/v2"
 	"net"
 	"time"
+
+	"github.com/c0m4r/nic/internal/executor"
 )
 
-var errDHCPv6NoAddresses = errors.New("no addresses in DHCPv6 reply")
+var (
+	errDHCPv6NoAddresses = errors.New("no addresses in DHCPv6 reply")
+	errDADFailed         = errors.New("duplicate address detection failed for the link-local address")
+)
+
+// linkLocalTimeout bounds the wait for duplicate address detection to finish.
+// DAD normally settles in about a second, but a link that has just gained
+// carrier can take noticeably longer.
+const linkLocalTimeout = 10 * time.Second
 
 // DHCPv6 multicast address for all relay agents and servers.
 var dhcpv6ServerAddr = &net.UDPAddr{
@@ -68,13 +79,20 @@ func doSolicit(ctx context.Context, conn net.PacketConn, duid v6DUID, iaid uint3
 	}
 
 	timeout := time.Second
+	var sendErr error
 	for attempt := 0; attempt < 4; attempt++ {
 		if err := ctx.Err(); err != nil {
 			return nil, nil, err
 		}
 
 		if _, err := conn.WriteTo(solicit, dst); err != nil {
-			return nil, nil, fmt.Errorf("send solicit: %w", err)
+			// The source address can still be unusable here when DAD restarts
+			// after a carrier bounce, which surfaces as EADDRNOTAVAIL. Retry
+			// instead of abandoning the lease on a transient condition.
+			sendErr = fmt.Errorf("send solicit: %w", err)
+			waitBeforeRetry(ctx, timeout)
+			timeout = min(timeout*2, 120*time.Second)
+			continue
 		}
 
 		_ = conn.SetReadDeadline(time.Now().Add(timeout))
@@ -114,7 +132,20 @@ func doSolicit(ctx context.Context, conn net.PacketConn, duid v6DUID, iaid uint3
 		return serverDUID, addrs, nil
 	}
 
+	if sendErr != nil {
+		return nil, nil, sendErr
+	}
 	return nil, nil, fmt.Errorf("no DHCPv6 advertise received")
+}
+
+// waitBeforeRetry sleeps for d unless the context is cancelled first.
+func waitBeforeRetry(ctx context.Context, d time.Duration) {
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+	case <-timer.C:
+	}
 }
 
 func doRequestV6(ctx context.Context, conn net.PacketConn, clientDUID v6DUID, serverDUID []byte, iaid uint32, txID [3]byte, addrs []iaAddrInfo, iface string) (*LeaseV6, error) {
@@ -126,13 +157,17 @@ func doRequestV6(ctx context.Context, conn net.PacketConn, clientDUID v6DUID, se
 	}
 
 	timeout := time.Second
+	var sendErr error
 	for attempt := 0; attempt < 4; attempt++ {
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
 
 		if _, err := conn.WriteTo(request, dst); err != nil {
-			return nil, fmt.Errorf("send request: %w", err)
+			sendErr = fmt.Errorf("send request: %w", err)
+			waitBeforeRetry(ctx, timeout)
+			timeout = min(timeout*2, 120*time.Second)
+			continue
 		}
 
 		_ = conn.SetReadDeadline(time.Now().Add(timeout))
@@ -158,6 +193,9 @@ func doRequestV6(ctx context.Context, conn net.PacketConn, clientDUID v6DUID, se
 		return parseLeaseV6(iface, msg, serverDUID, iaid, clientDUID)
 	}
 
+	if sendErr != nil {
+		return nil, sendErr
+	}
 	return nil, fmt.Errorf("no DHCPv6 reply received")
 }
 
@@ -374,42 +412,82 @@ func readLeaseV6Reply(conn net.PacketConn, txID [3]byte, clientDUID v6DUID, expe
 	}
 }
 
-// waitForLinkLocal waits for a non-tentative link-local address on the interface.
+// waitForLinkLocal waits for a non-tentative link-local address on the
+// interface. A solicit sourced from an address still undergoing duplicate
+// address detection is rejected by the kernel with EADDRNOTAVAIL, so DAD has
+// to finish before the exchange starts.
 func waitForLinkLocal(ctx context.Context, iface string) error {
-	deadline := time.After(5 * time.Second)
+	deadline := time.After(linkLocalTimeout)
+	var lastErr error
 	for {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-deadline:
+			if lastErr != nil {
+				return fmt.Errorf("waiting for link-local address on %s: %w", iface, lastErr)
+			}
 			return fmt.Errorf("timeout waiting for link-local address on %s", iface)
 		default:
 		}
 
-		ifaces, err := net.InterfaceByName(iface)
-		if err != nil {
-			time.Sleep(100 * time.Millisecond)
-			continue
-		}
-
-		addrs, err := ifaces.Addrs()
-		if err != nil {
-			time.Sleep(100 * time.Millisecond)
-			continue
-		}
-
-		for _, addr := range addrs {
-			ipNet, ok := addr.(*net.IPNet)
-			if !ok {
-				continue
-			}
-			if ipNet.IP.IsLinkLocalUnicast() && ipNet.IP.To4() == nil {
-				return nil
-			}
+		ready, err := hasUsableLinkLocal(iface)
+		switch {
+		case errors.Is(err, errDADFailed):
+			return fmt.Errorf("%w on %s", errDADFailed, iface)
+		case err != nil:
+			lastErr = err
+		case ready:
+			return nil
 		}
 
 		time.Sleep(100 * time.Millisecond)
 	}
+}
+
+// linkLocalAddrs mirrors the subset of `ip -j addr show` that DAD state is read
+// from. The net package does not expose per-address kernel flags, so tentative
+// and dadfailed can only be observed through ip.
+type linkLocalAddrs struct {
+	AddrInfo []struct {
+		Local     string `json:"local"`
+		Tentative bool   `json:"tentative"`
+		DadFailed bool   `json:"dadfailed"`
+	} `json:"addr_info"`
+}
+
+func hasUsableLinkLocal(iface string) (bool, error) {
+	output, err := executor.RunQuiet("ip", "-j", "-6", "addr", "show", "dev", iface, "scope", "link")
+	if err != nil {
+		return false, err
+	}
+	if output == "" {
+		return false, nil
+	}
+	var entries []linkLocalAddrs
+	if err := json.Unmarshal([]byte(output), &entries); err != nil {
+		return false, fmt.Errorf("parse addresses on %s: %w", iface, err)
+	}
+
+	dadFailed := false
+	for _, entry := range entries {
+		for _, addr := range entry.AddrInfo {
+			ip := net.ParseIP(addr.Local)
+			if ip == nil || ip.To4() != nil || !ip.IsLinkLocalUnicast() {
+				continue
+			}
+			switch {
+			case addr.DadFailed:
+				dadFailed = true
+			case !addr.Tentative:
+				return true, nil
+			}
+		}
+	}
+	if dadFailed {
+		return false, errDADFailed
+	}
+	return false, nil
 }
 
 // computeIAID generates a stable IAID from the interface name.

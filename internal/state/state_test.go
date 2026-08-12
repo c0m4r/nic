@@ -154,6 +154,92 @@ func TestLifetimeArgument(t *testing.T) {
 	}
 }
 
+// A sit tunnel reports a 4-byte link address and rejects every attempt to
+// change it, so restoring the address it already has must not be attempted.
+func TestRestoreSkipsUnchangedLinkProperties(t *testing.T) {
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "ip.log")
+	writeFakeIP(t, dir, `#!/bin/sh
+printf '%s\n' "$*" >> `+logPath+`
+case "$*" in
+"-j link show")
+	echo '[{"ifindex":3,"ifname":"sit0","flags":["NOARP"],"mtu":1480,"address":"0.0.0.0","operstate":"DOWN","link_type":"sit"}]'
+	;;
+*"link set dev sit0 address"*)
+	echo "RTNETLINK answers: Operation not supported" >&2
+	exit 2
+	;;
+esac
+exit 0
+`)
+	t.Setenv("PATH", dir)
+	statePath := filepath.Join(dir, "state.json")
+	snapshot := NetworkState{
+		Interfaces: []Interface{{IfIndex: 3, IfName: "sit0", MTU: 1480, Address: "0.0.0.0", Link: "sit"}},
+		DNS:        dns.Snapshot{},
+	}
+	data, err := json.Marshal(snapshot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(statePath, data, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := RestoreState(statePath); err != nil {
+		t.Fatalf("RestoreState error = %v", err)
+	}
+	log, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(log), "link set dev sit0 address") {
+		t.Fatalf("unchanged link address was rewritten:\n%s", log)
+	}
+	if strings.Contains(string(log), "link set dev sit0 mtu") {
+		t.Fatalf("unchanged MTU was rewritten:\n%s", log)
+	}
+}
+
+func TestRestoreRewritesDriftedLinkProperties(t *testing.T) {
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "ip.log")
+	writeFakeIP(t, dir, `#!/bin/sh
+printf '%s\n' "$*" >> `+logPath+`
+case "$*" in
+"-j link show")
+	echo '[{"ifindex":2,"ifname":"eth0","flags":["BROADCAST"],"mtu":1500,"address":"52:54:00:12:34:56","operstate":"DOWN","link_type":"ether"}]'
+	;;
+esac
+exit 0
+`)
+	t.Setenv("PATH", dir)
+	statePath := filepath.Join(dir, "state.json")
+	snapshot := NetworkState{
+		Interfaces: []Interface{{IfIndex: 2, IfName: "eth0", MTU: 9000, Address: "52:54:00:ab:cd:ef", Link: "ether"}},
+		DNS:        dns.Snapshot{},
+	}
+	data, err := json.Marshal(snapshot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(statePath, data, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := RestoreState(statePath); err != nil {
+		t.Fatalf("RestoreState error = %v", err)
+	}
+	log, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(log), "link set dev eth0 address 52:54:00:ab:cd:ef") {
+		t.Fatalf("drifted link address was not restored:\n%s", log)
+	}
+	if !strings.Contains(string(log), "link set dev eth0 mtu 9000") {
+		t.Fatalf("drifted MTU was not restored:\n%s", log)
+	}
+}
+
 func writeFakeIP(t *testing.T, dir, content string) {
 	t.Helper()
 	if err := os.WriteFile(filepath.Join(dir, "ip"), []byte(content), 0755); err != nil {

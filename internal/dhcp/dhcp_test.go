@@ -142,6 +142,82 @@ func TestEnsureInterfaceUp(t *testing.T) {
 	}
 }
 
+func fakeIPReporting(t *testing.T, output string) {
+	t.Helper()
+	dir := t.TempDir()
+	script := "#!/bin/sh\necho '" + output + "'\n"
+	if err := os.WriteFile(filepath.Join(dir, "ip"), []byte(script), 0755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir)
+	oldDryRun := executor.DryRun
+	executor.DryRun = false
+	t.Cleanup(func() { executor.DryRun = oldDryRun })
+}
+
+func TestHasUsableLinkLocal(t *testing.T) {
+	tests := []struct {
+		name    string
+		output  string
+		want    bool
+		wantDAD bool
+	}{{
+		name:   "address still undergoing DAD is unusable",
+		output: `[{"ifname":"eth0","addr_info":[{"local":"fe80::5054:ff:fe12:3456","tentative":true}]}]`,
+	}, {
+		name:   "settled address is usable",
+		output: `[{"ifname":"eth0","addr_info":[{"local":"fe80::5054:ff:fe12:3456"}]}]`,
+		want:   true,
+	}, {
+		name:    "duplicate address is reported",
+		output:  `[{"ifname":"eth0","addr_info":[{"local":"fe80::5054:ff:fe12:3456","dadfailed":true}]}]`,
+		wantDAD: true,
+	}, {
+		name:   "no link-local address yet",
+		output: `[{"ifname":"eth0","addr_info":[]}]`,
+	}}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			fakeIPReporting(t, tt.output)
+			got, err := hasUsableLinkLocal("eth0")
+			if tt.wantDAD {
+				if !errors.Is(err, errDADFailed) {
+					t.Fatalf("hasUsableLinkLocal error = %v, want errDADFailed", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got != tt.want {
+				t.Fatalf("hasUsableLinkLocal = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestWaitForLinkLocalFailsFastOnDuplicateAddress(t *testing.T) {
+	fakeIPReporting(t, `[{"ifname":"eth0","addr_info":[{"local":"fe80::5054:ff:fe12:3456","dadfailed":true}]}]`)
+	start := time.Now()
+	err := waitForLinkLocal(context.Background(), "eth0")
+	if !errors.Is(err, errDADFailed) {
+		t.Fatalf("waitForLinkLocal error = %v, want errDADFailed", err)
+	}
+	if elapsed := time.Since(start); elapsed >= linkLocalTimeout {
+		t.Fatalf("waitForLinkLocal waited %v for a permanent failure", elapsed)
+	}
+}
+
+func TestWaitForLinkLocalHonorsContextCancellation(t *testing.T) {
+	fakeIPReporting(t, `[{"ifname":"eth0","addr_info":[{"local":"fe80::5054:ff:fe12:3456","tentative":true}]}]`)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := waitForLinkLocal(ctx, "eth0"); !errors.Is(err, context.Canceled) {
+		t.Fatalf("waitForLinkLocal error = %v, want context.Canceled", err)
+	}
+}
+
 func TestDUIDPersistsAcrossCalls(t *testing.T) {
 	original := duidFilePath
 	duidFilePath = filepath.Join(t.TempDir(), "duid")

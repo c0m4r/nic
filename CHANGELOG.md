@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 Types of changes: Added, Changed, Deprecated, Removed, Fixed, Security
 
+## [Unreleased]
+
+### Fixed
+
+- Fixed baseline restore failing on hosts with a tunnel device such as `sit0`, which rejects every link-layer address change. Link addresses and MTUs are now only rewritten when they differ from the live value, so `start`, `stop`, and `restart` no longer abort before configuring anything.
+- Fixed DHCPv6 aborting with `sendto: cannot assign requested address` when the solicit was sent from a link-local address still undergoing duplicate address detection. The client now waits for DAD to settle, reports a duplicate address instead of hanging, and retries transient send failures.
+
 ## [0.1.4] - 2026-08-12
 
 ### Fixed
