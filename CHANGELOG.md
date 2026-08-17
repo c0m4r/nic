@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 Types of changes: Added, Changed, Deprecated, Removed, Fixed, Security
 
+## [0.1.6] - 2026-08-17
+
+### Fixed
+
+- IPv6 DAD running without active v6
+
 ## [0.1.5] - 2026-08-12
 
 ### Added

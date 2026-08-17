@@ -292,6 +292,59 @@ func TestHasGlobalAddressPropagatesFailure(t *testing.T) {
 	}
 }
 
+func TestHasTentativeGlobalAddress(t *testing.T) {
+	tests := []struct {
+		name   string
+		output string
+		want   bool
+	}{{
+		name:   "tentative global counts",
+		output: `[{"ifname":"eth0","addr_info":[{"family":"inet6","local":"2001:db8::1","scope":"global","tentative":true}]}]`,
+		want:   true,
+	}, {
+		name:   "tentative universe counts",
+		output: `[{"ifname":"eth0","addr_info":[{"family":"inet6","local":"2001:db8::1","scope":"universe","tentative":true}]}]`,
+		want:   true,
+	}, {
+		// The one that mattered: the kernel's own link-local spends its first
+		// second tentative and may never leave that state on a link where
+		// nothing answers a neighbour solicitation. Waiting for it was what made
+		// every "nic start" pay the full DAD timeout.
+		name:   "tentative link-local does not count",
+		output: `[{"ifname":"eth0","addr_info":[{"family":"inet6","local":"fe80::1","scope":"link","tentative":true}]}]`,
+	}, {
+		name:   "settled global does not count",
+		output: `[{"ifname":"eth0","addr_info":[{"family":"inet6","local":"2001:db8::1","scope":"global"}]}]`,
+	}, {
+		name:   "no addresses",
+		output: `[{"ifname":"eth0","addr_info":[]}]`,
+	}}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := t.TempDir()
+			writeFakeIP(t, dir, "#!/bin/sh\necho '"+tt.output+"'\n")
+			t.Setenv("PATH", dir)
+			got, err := HasTentativeGlobalAddress("eth0")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got != tt.want {
+				t.Fatalf("HasTentativeGlobalAddress = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestHasTentativeGlobalAddressPropagatesFailure(t *testing.T) {
+	dir := t.TempDir()
+	writeFakeIP(t, dir, "#!/bin/sh\necho no-such-device >&2\nexit 1\n")
+	t.Setenv("PATH", dir)
+	if _, err := HasTentativeGlobalAddress("eth0"); err == nil || !strings.Contains(err.Error(), "no-such-device") {
+		t.Fatalf("HasTentativeGlobalAddress error = %v", err)
+	}
+}
+
 func writeFakeIP(t *testing.T, dir, content string) {
 	t.Helper()
 	if err := os.WriteFile(filepath.Join(dir, "ip"), []byte(content), 0755); err != nil {

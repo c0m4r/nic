@@ -136,6 +136,41 @@ func GetRoutes6() ([]Route, error) {
 	return routes, nil
 }
 
+// HasTentativeGlobalAddress reports whether an interface holds a global address
+// that duplicate address detection has not finished with yet.
+//
+// This is the mirror image of HasGlobalAddress, and it exists because the two
+// answer halves of one question. "No global address" can mean the interface
+// failed to configure, or it can mean the address is already there and DAD is
+// still running on it; only the second is worth waiting for. Link-local and host
+// addresses are excluded here for the same reason they are excluded there:
+// HasGlobalAddress would not count one, so waiting for one cannot change its
+// answer.
+func HasTentativeGlobalAddress(iface string) (bool, error) {
+	output, err := executor.RunQuiet("ip", "-j", "addr", "show", "dev", iface)
+	if err != nil {
+		return false, err
+	}
+	if output == "" {
+		return false, nil
+	}
+	var entries []AddrEntry
+	if err := json.Unmarshal([]byte(output), &entries); err != nil {
+		return false, fmt.Errorf("parse addresses on %s: %w", iface, err)
+	}
+	for _, entry := range entries {
+		for _, addr := range entry.AddrInfo {
+			if !addr.Tentative {
+				continue
+			}
+			if addr.Scope == "global" || addr.Scope == "universe" {
+				return true, nil
+			}
+		}
+	}
+	return false, nil
+}
+
 // HasGlobalAddress reports whether an interface currently holds at least one
 // usable address of any family. Link-local, host, and still-tentative addresses
 // do not count, so this answers "did any address family configure this link".

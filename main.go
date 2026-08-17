@@ -396,8 +396,15 @@ func applyConfig(cfg *config.Config, daemonMode bool) error {
 		return fmt.Errorf("write resolv.conf: %w", err)
 	}
 
-	// Wait for IPv6 DAD (duplicate address detection) to complete
-	waitForDAD()
+	// Wait for IPv6 duplicate address detection, but only where the answer is
+	// about to be read. resolveOptionalDHCPv6 is the one thing downstream of
+	// this that a tentative address can mislead, so with no optional DHCPv6
+	// failure to judge there is nothing to wait for and nothing to gain by
+	// waiting: a configuration that asks for no DHCPv6 at all used to pay the
+	// full timeout here.
+	if len(optionalV6Failures) > 0 {
+		waitForDAD(optionalV6Failures)
+	}
 
 	// Resolved only after DAD so an address that is merely still tentative is
 	// not mistaken for an unconfigured interface.
@@ -1271,24 +1278,84 @@ func setupLoopback() {
 	_, _ = executor.RunIP("addr", "add", "::1/128", "dev", "lo")
 }
 
-func waitForDAD() {
-	// Wait for IPv6 Duplicate Address Detection to complete.
-	// Tentative addresses cannot be used until DAD finishes.
-	maxWait := 3 * time.Second
-	interval := 200 * time.Millisecond
-	deadline := time.Now().Add(maxWait)
+// How long duplicate address detection is given to finish, and how often it is
+// asked. The kernel's own DAD takes dad_transmits * retrans_time - a second by
+// default - so a second and a half is a wait for something that is going to
+// happen rather than a hope that it might.
+const (
+	dadSettleTimeout = 1500 * time.Millisecond
+	dadPollInterval  = 50 * time.Millisecond
+)
 
-	for time.Now().Before(deadline) {
-		output := executor.RunSilent("ip", "-6", "addr", "show", "tentative")
-		if output == "" {
-			return // No tentative addresses, DAD complete
+// waitForDAD waits for duplicate address detection to finish on the interfaces
+// whose DHCPv6 result has not been decided yet.
+//
+// The question being waited on is the one resolveOptionalDHCPv6 asks: has this
+// interface ended up with a global address it can use? A tentative address is
+// not one, so the wait is worth making - but only for those interfaces, and only
+// for global addresses.
+//
+// It used to ask "ip -6 addr show tentative", which is every interface on the
+// machine and every scope, and it waited three seconds for that to come back
+// empty. Two things were wrong with it. A tentative address on an interface nic
+// had never touched would hold up a configuration that had nothing to do with
+// it. And the address it almost always found was the kernel's own link-local,
+// which nic does not configure and nothing here reads - so on a link where DAD
+// does not complete, and a point-to-point or emulated link may never complete
+// it, every single "nic start" ran the full three seconds out. Measured on a
+// configuration that brought one link up and asked for no lease at all, that was
+// 3.02 of the 3.04 seconds the command took.
+func waitForDAD(pending []optionalDHCPv6Failure) {
+	deadline := time.Now().Add(dadSettleTimeout)
+
+	for {
+		if !anyTentativeGlobalAddress(pending) {
+			return
 		}
-		time.Sleep(interval)
+		if !time.Now().Before(deadline) {
+			break
+		}
+		time.Sleep(dadPollInterval)
 	}
 
-	if executor.Verbose {
-		fmt.Println("Warning: IPv6 DAD did not complete within timeout")
+	// Not behind Verbose. Reaching this means an address nic is about to judge
+	// is still tentative, so the judgement that follows may call an interface
+	// unconfigured when it is merely not finished - which is exactly the kind of
+	// thing whoever reads the failure needs to have been told.
+	fmt.Fprintf(os.Stderr,
+		"warning: IPv6 duplicate address detection did not finish within %s on %s\n",
+		dadSettleTimeout, strings.Join(pendingInterfaces(pending), ", "))
+}
+
+// anyTentativeGlobalAddress reports whether any interface still awaiting a
+// DHCPv6 verdict has a global address in the middle of DAD. An interface the
+// kernel cannot be asked about is not something to wait on, so a failed query
+// counts as settled rather than as a reason to keep looping.
+func anyTentativeGlobalAddress(pending []optionalDHCPv6Failure) bool {
+	for _, iface := range pendingInterfaces(pending) {
+		tentative, err := state.HasTentativeGlobalAddress(iface)
+		if err != nil {
+			continue
+		}
+		if tentative {
+			return true
+		}
 	}
+	return false
+}
+
+// The interfaces named in a set of undecided DHCPv6 failures, each once.
+func pendingInterfaces(pending []optionalDHCPv6Failure) []string {
+	seen := make(map[string]bool, len(pending))
+	names := make([]string, 0, len(pending))
+	for _, failure := range pending {
+		if seen[failure.iface] {
+			continue
+		}
+		seen[failure.iface] = true
+		names = append(names, failure.iface)
+	}
+	return names
 }
 
 func confirm() bool {
